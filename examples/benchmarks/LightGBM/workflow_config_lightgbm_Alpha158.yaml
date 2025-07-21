@@ -1,5 +1,5 @@
 qlib_init:
-    provider_uri: "~/.qlib/qlib_data/cn_data"
+    provider_uri: "data"
     region: cn
 market: &market csi300
 benchmark: &benchmark SH000300
@@ -53,7 +53,7 @@ task:
             segments:
                 train: [2008-01-01, 2014-12-31]
                 valid: [2015-01-01, 2016-12-31]
-                test: [2017-01-01, 2020-08-01]
+                test: [2017-01-01, 2025-07-15]
     record: 
         - class: SignalRecord
           module_path: qlib.workflow.record_temp

@@ -1,0 +1,193 @@
+qlib_init:
+    provider_uri: "data"
+    region: cn
+market: &market csi300
+benchmark: &benchmark SH000300
+data_handler_config: &data_handler_config
+    start_time: 2008-01-01
+    end_time: 2020-08-01
+    fit_start_time: 2008-01-01
+    fit_end_time: 2014-12-31
+    instruments: *market
+port_analysis_config: &port_analysis_config
+    strategy:
+        class: TopkDropoutStrategy
+        module_path: qlib.contrib.strategy
+        kwargs:
+            signal: <PRED>
+            topk: 50
+            n_drop: 5
+    backtest:
+        start_time: 2017-01-01
+        end_time: 2020-08-01
+        account: 100000000
+        benchmark: *benchmark
+        exchange_kwargs:
+            limit_threshold: 0.095
+            deal_price: close
+            open_cost: 0.0005
+            close_cost: 0.0015
+            min_cost: 5
+task:
+    model:
+        class: LGBModel
+        module_path: qlib.contrib.model.gbdt
+        kwargs:
+            loss: mse
+            colsample_bytree: 0.8879
+            learning_rate: 0.2
+            subsample: 0.8789
+            lambda_l1: 205.6999
+            lambda_l2: 580.9768
+            max_depth: 8
+            num_leaves: 210
+            num_threads: 20
+    dataset:
+        class: DatasetH
+        module_path: qlib.data.dataset
+        kwargs:
+            handler:
+                class: DataHandlerLP
+                module_path: qlib.data.dataset.handler
+                kwargs:
+                    data_loader:
+                        class: QlibDataLoader
+                        kwargs:
+                            config:
+                                feature: [[
+                                    '(-1 * Corr(Rank(Delta(Log($volume),1)), Rank((($close - $low) - ($high - $close)) / ($high - $low)),6))',
+                                    '(-1 * Delta((($close - $low) - ($high - $close)) / ($high - $low),1))',
+                                    'Sum($close,8) / 8 + Std($close,8) * (Sum($close,8) / 8 - Sum($close,2) / 2) / Pow((Sum($close,8) / 8 - Sum($close,2) / 2), 2) * Abs(Sum($close,8) / 8 - Sum($close,2) / 2) / Std($close,8)',
+                                    'Sum($close,8) / 8 - Std($close,8) * (Sum($close,8) / 8 - Sum($close,2) / 2) / Pow((Sum($close,8) / 8 - Sum($close,2) / 2), 2) * Abs(Sum($close,8) / 8 - Sum($close,2) / 2) / Std($close,8)',
+                                    '(-1 * TsMax(Corr(TsRank($volume,5), TsRank($high,5),5),3))',
+                                    '(Rank((Sum($close,5) / Sum($close,20))) * (-1 * Rank(($high - Delay($high,5)))))',
+                                    '(Rank(($open - Sum($vwap,10) / 10)) * (-1 * Rank(Abs(($close - $vwap)))))',
+                                    'Rank(Delta(((( $high + $low ) / 2) * 0.2 + $vwap * 0.8),4) -1)',
+                                    'SMA((( $high + $low ) / 2 - ( Delay($high,1) + Delay($low,1) ) / 2 ) * ( $high - $low ) / $volume,61,2)',
+                                    'Rank(Max(If( $high - $low > 0, Std( $high - $low ,20), $close),20))',
+                                    'Sum((($close - $low) - ($high - $close)) / ($high - $low) * $volume,6)',
+                                    '(Rank(($open - Sum($vwap,10) / 10)) * (-1 * Rank(Abs(($close - $vwap)))))',
+                                    'Pow(( $high * $low ),0.5) - $vwap',
+                                    ' $close - Delay($close,5)',
+                                    ' $open / Delay($close,1) -1',
+                                    '(-1 * TsMax(Rank(Corr(Rank($volume), Rank($vwap),5)),5))',
+                                    'Rank(($vwap - Max($vwap,15))) ^ Delta($close,5)',
+                                    ' $close / Delay($close,5)',
+                                    'If( $close < Delay($close,5), ( $close - Delay($close,5)) / Delay($close,5), ( $close - Delay($close,5)) / $close )',
+                                    '( $close - Delay($close,6) ) / Delay($close,6) * 100',
+                                    'Regr(Mean($volume,8) / Mean($volume,2) ,8)',
+                                    'SMA((( $close - Mean($close,6) ) / Mean($close,6) - Delay(( $close - Mean($close,6) ) / Mean($close,6),3)) / Std($close,6),12,1)',
+                                    'SMA(If( $close > Delay($close,1), Std($close,20),0),20,1) / (SMA(If( $close > Delay($close,1), Std($close,20),0),20,1) + SMA(If( $close < Delay($close,1), Std($close,20),0),20,1)) * 100',
+                                    'SMA( $close - Delay($close,5),5)',
+                                    '(-1 * Rank(Delta( $close,7) * (1 - Rank(DecayLinear( $volume / Mean($volume,20),9))))) * (1 + Rank(Sum(Ret,100)))',
+                                    '(Sum($high,5) / Sum($close,5)) * 100 - Delay((Sum($high,5) / Sum($close,5)) * 100,3)',
+                                    'WMA(( ( $close - Delay($close,3) ) / Delay($close,3) * 100 + ( $close - Delay($close,6) ) / Delay($close,6) * 100 ) / 2,12)',
+                                    '3*SMA(( $close - TsMin($low,9)) / (TsMax($high,9) - TsMin($low,9)) *100,3,1) - 2*SMA(SMA(( $close - TsMin($low,9)) / (TsMax($high,9) - TsMin($low,9)) *100,3,1),3,1)',
+                                    'SMA( $close - Delay($close,6) / Delay($close,6) * $volume,9,1)',
+                                    'WMA((Regr( $close , Mean($volume,5) ,5) - Delay(Regr( $close , Mean($volume,5) ,5),1)) ^2 ,5)',
+                                    '( $close - Mean($close,12) ) / Mean($close,12) * 100',
+                                    '(-1 * Sum ( Rank ( Corr ( Rank($high) , Rank($volume) ,3 ) ) ,3 ) )',
+                                    '(-1 * TsMin($low,5))',
+                                    ' Mean($close,12) / $close',
+                                    '(TsRank($volume,32) * (1 - TsRank( ( $close + $high - $low ),16)) * (1 - TsRank(Ret,32)))',
+                                    'Rank(Sum(Corr(Rank($volume), Rank($vwap) ,6),2))',
+                                    'SMA( Delay( Corr( ( $open - $close ) /2 , Delay( ( $close - $open ) ,1 ) ,16 ) ,1 ) ,20,1)',
+                                    'If( Sum($high,20) / 20 < $high , (-1 * Delta($high,2)) , 0 )',
+                                    'SMA( Sma( ( Sma( $close ,2 ) / 2 - Sma( $low ,4 ) / 4 ) ,4 ,1 ) ,4 ,1 ) / Sma( $close ,8 ) / 8 * $volume', # adjusted
+                                    'Sum(If( $close > Delay($close,1), $volume , 0 ),26) / Sum(If( $close < Delay($close,1), $volume , 0 ),26) * 100',
+                                    'Rank(Max(Delta($vwap,3),5))* (-1 * Rank(Delta($close,5)))',
+                                    '(-1 * Rank(Std($high, 10)) * Corr($high, $volume,10))',
+                                    ' Sum(If( $close > Delay($close,1), $volume , If( $close < Delay($close,1), - $volume ,0 ) ),6 ) / $volume',
+                                    ' TsRank(Corr($low , Mean($volume,10) ,7 ) ,9 )',
+                                    ' Rank(Delta( ( $close * 0.6 + $open *0.4 ) ,5 ) ) * (-1 * Corr( Mean($vwap,7) , $volume ,3 ) )',
+                                    ' ( Mean($close,3) + Mean($close,6) + Mean($close,12) + Mean($close,24) ) / 4 - $close',
+                                    ' SMA( ( TsMax($high,6) - $close ) / ( TsMax($high,6) - TsMin($low,6) ) *100 ,9 ,1 )',
+                                    ' (-1 * Rank( Sign( $close - Delay($close,1) ) * Sign( Delay($close,1) - Delay($close,2) ) * Sign( Delay($close,2) - Delay($close,3) ) ) )',
+                                    ' Sum( If( $high + $low >= Delay($high,1) + Delay($low,1) , 0 , Max( Abs( $high - Delay($high,1) ) , Abs( $low - Delay($low,1) ) ) ) ,12 ) / ( Sum( If( $high + $low >= Delay($high,1) + Delay($low,1) , 0 , Max( Abs( $high - Delay($high,1) ) , Abs( $low - Delay($low,1) ) ) ) ,12 ) + Sum( If( $high + $low <= Delay($high,1) + Delay($low,1) , 0 , Max( Abs( $high - Delay($high,1) ) , Abs( $low - Delay($low,1) ) ) ) ,12 ) )',
+                                    ' Sum( If( $high + $low <= Delay($high,1) + Delay($low,1) , 0 , Max( Abs( $high - Delay($high,1) ) , Abs( $low - Delay($low,1) ) ) ) ,12 ) / ( Sum( If( $high + $low <= Delay($high,1) + Delay($low,1) , 0 , Max( Abs( $high - Delay($high,1) ) , Abs( $low - Delay($low,1) ) ) ) ,12 ) + Sum( If( $high + $low >= Delay($high,1) + Delay($low,1) , 0 , Max( Abs( $high - Delay($high,1) ) , Abs( $low - Delay($low,1) ) ) ) ,12 ) )',
+                                    ' Sum( If( $high + $low <= Delay($high,1) + Delay($low,1) , 0 , Max( Abs( $high - Delay($high,1) ) , Abs( $low - Delay($low,1) ) ) ) ,12 ) / ( Sum( If( $high + $low <= Delay($high,1) + Delay($low,1) , 0 , Max( Abs( $high - Delay($high,1) ) , Abs( $low - Delay($low,1) ) ) ) ,12 ) + Sum( If( $high + $low >= Delay($high,1) + Delay($low,1) , 0 , Max( Abs( $high - Delay($high,1) ) , Abs( $low - Delay($low,1) ) ) ) ,12 ) )',
+                                    ' Sum( TsMax($high,5) ,5) / Sum( TsMax($high,5) + TsMin($low,5) ,5 ) * 100',
+                                    ' Count( $close > Delay($close,1) ,12 ) / 12 * 100',
+                                    ' (-1 * Rank( ( Std( Abs( $close - $open ) ) + ( $close - $open ) ) + Corr( $close , $open ,10 ) ) )',
+                                    ' (Min(Rank(DecayLinear(Delta($open,1),15)), Rank(DecayLinear(Corr($volume, ( $open * 0.65 ) + ( $open * 0.35 ) ,17))), -1))'
+                                ], [
+                                    'ALPHA1',
+                                    'ALPHA2',
+                                    'ALPHA3',
+                                    'ALPHA4',
+                                    'ALPHA5',
+                                    'ALPHA6',
+                                    'ALPHA7',
+                                    'ALPHA8',
+                                    'ALPHA9',
+                                    'ALPHA10',
+                                    'ALPHA11',
+                                    'ALPHA12',
+                                    'ALPHA13',
+                                    'ALPHA14',
+                                    'ALPHA15',
+                                    'ALPHA16',
+                                    'ALPHA17',
+                                    'ALPHA18',
+                                    'ALPHA19',
+                                    'ALPHA20',
+                                    'ALPHA21',
+                                    'ALPHA22',
+                                    'ALPHA23',
+                                    'ALPHA24',
+                                    'ALPHA25',
+                                    'ALPHA26',
+                                    'ALPHA27',
+                                    'ALPHA28',
+                                    'ALPHA29',
+                                    'ALPHA30',
+                                    'ALPHA31',
+                                    'ALPHA32',
+                                    'ALPHA33',
+                                    'ALPHA34',
+                                    'ALPHA35',
+                                    'ALPHA36',
+                                    'ALPHA37',
+                                    'ALPHA38',
+                                    'ALPHA39',
+                                    'ALPHA40',
+                                    'ALPHA41',
+                                    'ALPHA42',
+                                    'ALPHA43',
+                                    'ALPHA44',
+                                    'ALPHA45',
+                                    'ALPHA46',
+                                    'ALPHA47',
+                                    'ALPHA48',
+                                    'ALPHA49',
+                                    'ALPHA50',
+                                    'ALPHA51',
+                                    'ALPHA52',
+                                    'ALPHA53',
+                                    'ALPHA54',
+                                    'ALPHA55'
+                                ]]
+                                label: [[
+                                    'Ref($close, -2)/Ref($close, -1) - 1'
+                                ], [
+                                    'LABEL0'
+                                ]]
+            segments:
+                train: [2008-01-01, 2014-12-31]
+                valid: [2015-01-01, 2016-12-31]
+                test: [2017-01-01, 2025-07-15]
+    record: 
+        - class: SignalRecord
+          module_path: qlib.workflow.record_temp
+          kwargs: 
+            model: <MODEL>
+            dataset: <DATASET>
+        - class: SigAnaRecord
+          module_path: qlib.workflow.record_temp
+          kwargs: 
+            ana_long_short: False
+            ann_scaler: 252
+        - class: PortAnaRecord
+          module_path: qlib.workflow.record_temp
+          kwargs: 
+            config: *port_analysis_config 
