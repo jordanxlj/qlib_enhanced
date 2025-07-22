@@ -63,14 +63,14 @@ task:
                                     'Sum(If($close == Ref($close,1), 0, $close - If($close > Ref($close,1), Min($low, Ref($close,1)), Max($high, Ref($close,1)))), 6)',
                                     'If((Sum($close,8)/8 + Std($close,8)) < (Sum($close,2)/2), -1, If((Sum($close,2)/2) < (Sum($close,8)/8 - Std($close,8)), 1, If(($volume / Mean($volume,20)) >= 1, 1, -1)))',
                                     '(-1 * Max(Corr(TSRank($volume,5), TSRank($high,5),5),3))',
-                                    '(CSRank(Sign(Delta((($open * 0.85) + ($high * 0.15)), 4))) * -1)'
+                                    '(CSRank(Sign(Delta((($open * 0.85) + ($high * 0.15)), 4))) * -1)',
                                     '(CSRank(Max(($vwap - $close), 3)) + CSRank(Min(($vwap - $close), 3))) * CSRank(Delta($volume, 3))',
                                     'CSRank(Delta((((($high + $low)/2) * 0.2) + ($vwap * 0.8)), 4) * -1)',
-                                    'Mean((((($high + $low)/2) - ((Ref($high,1) + Ref($low,1))/2)) * (($high - $low)/$volume)), 7/2)', # Assuming SMA as Mean with adjusted window
-                                    'CSRank(Max(If(Ret < 0, Std(Ret,20), $close)^2, 5))',
+                                    'EMA((((($high + $low)/2) - ((Ref($high,1) + Ref($low,1))/2)) * (($high - $low)/$volume)), 7/2)', # Assuming SMA as Mean with adjusted window
+                                    'CSRank(Max(Power(If(($close / Ref($close, 1)) - 1 < 0, Std(($close / Ref($close, 1)) - 1, 20), $close), 2), 5))',
                                     'CSRank(Delta(((( $high + $low ) / 2) * 0.2 + $vwap * 0.8),4) * -1)',
                                     'EMA((($high + $low) / 2 - (Ref($high,1) + Ref($low,1)) / 2) * ( $high - $low) / $volume, 61/2)',
-                                    'CSRank(Max(If($high - $low > 0, Std($high - $low ,20), $close),20))',
+                                    'CSRank(Max(If($high - $low > 0, Std($high - $low ,20), $close), 20))',
                                 ], [
                                     'ALPHA1',
                                     'ALPHA2',
