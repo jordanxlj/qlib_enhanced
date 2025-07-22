@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from typing import Union, List, Type
-from scipy.stats import percentileofscore
+from scipy.stats import percentileofscore, rankdata
 from .base import Expression, ExpressionOps, Feature, PFeature
 from ..log import get_module_logger
 from ..utils import get_callable_kwargs
@@ -1562,6 +1562,74 @@ class TResample(ElemOperator):
                 return getattr(series.resample(self.freq), self.func)()
 
 
+class CSRank(ExpressionOps):
+    """Cross-Sectional Rank Operator (Percentile across assets at each date)
+
+    Parameters
+    ----------
+    feature : Expression
+        feature instance
+
+    Returns
+    ----------
+    Expression
+        cross-sectional rank (percentile) of the feature
+    """
+
+    def __init__(self, feature):
+        self.feature = feature
+
+    def __str__(self):
+        return f"CSRank({self.feature})"
+
+    def _load_internal(self, instrument, start_index, end_index, *args):
+        # CSRank cannot be computed for individual instruments since it requires cross-sectional data
+        # For now, return the raw feature values and let a data processor handle cross-sectional ranking
+        series = self.feature.load(instrument, start_index, end_index, *args)
+        
+        # Mark this series for cross-sectional processing by adding a special name prefix
+        series.name = f"__CSRANK__{str(self.feature)}"
+        return series
+
+    def get_longest_back_rolling(self):
+        return self.feature.get_longest_back_rolling()
+
+    def get_extended_window_size(self):
+        return self.feature.get_extended_window_size()
+
+class TSRank(Rolling):
+    """Time-Series Rank Operator (Rolling Percentile over time for each asset)
+
+    Parameters
+    ----------
+    feature : Expression
+        feature instance
+    N : int
+        rolling window size
+
+    Returns
+    ----------
+    Expression
+        time-series rolling rank (percentile) of the feature
+    """
+
+    def __init__(self, feature, N):
+        super(TSRank, self).__init__(feature, N, "ts_rank")
+
+    def _load_internal(self, instrument, start_index, end_index, *args):
+        series = self.feature.load(instrument, start_index, end_index, *args)
+        
+        # For TSRank, we apply rolling rank on the time series for this single instrument
+        # No need to group by instrument since we're already processing one instrument at a time
+        def rolling_rank_func(x):
+            if len(x) == 0:
+                return np.nan
+            return rankdata(x, method='average')[-1] / len(x)
+        
+        ranked_series = series.rolling(self.N, min_periods=1).apply(rolling_rank_func, raw=True)
+        return ranked_series
+
+
 TOpsList = [TResample]
 OpsList = [
     ChangeInstrument,
@@ -1613,6 +1681,8 @@ OpsList = [
     If,
     Feature,
     PFeature,
+    CSRank,
+    TSRank,
 ] + [TResample]
 
 

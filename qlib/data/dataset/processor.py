@@ -417,3 +417,53 @@ class TimeRangeFlt(InstProcessor):
         ):
             return df
         return df.head(0)
+
+
+class CSRankProcessor(Processor):
+    """
+    Cross-Sectional Rank Processor
+    
+    This processor identifies columns that need cross-sectional ranking (marked with __CSRANK__ prefix)
+    and applies cross-sectional ranking across all instruments for each date.
+    """
+
+    def __init__(self, fields_group=None):
+        self.fields_group = fields_group
+
+    def __call__(self, df):
+        # Find columns that need CSRank processing
+        csrank_cols = [col for col in df.columns if str(col).startswith('__CSRANK__')]
+        
+        if not csrank_cols:
+            return df
+        
+        # Process each CSRank column
+        for col in csrank_cols:
+            # Apply cross-sectional ranking
+            ranked_series = df[col].groupby("datetime").apply(self._rank_group)
+            
+            # Create new column name without the prefix
+            original_col_name = str(col).replace('__CSRANK__', 'CSRank')
+            df[original_col_name] = ranked_series
+            
+            # Remove the temporary column
+            df = df.drop(columns=[col])
+        
+        return df
+    
+    def _rank_group(self, group):
+        """Apply ranking within a group (all instruments for a single date)"""
+        if len(group) == 0:
+            return group
+        
+        # Remove NaN values for ranking
+        non_nan_mask = group.notna()
+        if non_nan_mask.sum() == 0:
+            return pd.Series(np.nan, index=group.index)
+        
+        # Rank only non-NaN values as percentiles
+        ranks = pd.Series(np.nan, index=group.index)
+        non_nan_values = group[non_nan_mask]
+        from scipy.stats import rankdata
+        ranks[non_nan_mask] = rankdata(non_nan_values, method='average') / len(non_nan_values)
+        return ranks

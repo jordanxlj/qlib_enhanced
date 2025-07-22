@@ -93,7 +93,6 @@ class DLWParser(DataLoader):
             self.fields = self._parse_fields_info(config)
 
     def _parse_fields_info(self, fields_info: Union[list, tuple]) -> Tuple[list, list]:
-        print(f"fields_info: {fields_info}")
         if len(fields_info) == 0:
             raise ValueError("The size of fields must be greater than 0")
 
