@@ -6,7 +6,7 @@
 import numpy as np
 import pandas as pd
 import unittest
-from qlib.data.ops import CSRank, TSRank, Feature
+from qlib.data.ops import CSRank, TSRank, Feature, cs_rank_numba
 from scipy.stats import rankdata  # 添加导入以修复NameError
 from qlib import init as qlib_init
 
@@ -67,28 +67,17 @@ class TestRankOperators(unittest.TestCase):
 
         # 模拟跨截面排名 (像处理器那样)
         def simulate_cs_rank(df):
-            csrank_cols = [col for col in df.columns if str(col).startswith('__CSRANK__')]
-            for col in csrank_cols:
-
-                def rank_group(group):
-                    # Create a series of NaNs with the same index as the group
-                    ranks = pd.Series(np.nan, index=group.index, dtype=float)
-                    # Get the non-NaN values
-                    valid_values = group.dropna()
-                    # If there are no valid values, we're done (return all NaNs)
-                    if valid_values.empty:
-                        return ranks
-                    # Calculate ranks on the valid values
-                    ranked_values = rankdata(valid_values, method='average') / len(valid_values)
-                    # Place the calculated ranks back into the series at the correct locations
-                    ranks.loc[valid_values.index] = ranked_values
-                    return ranks
-
-                ranked = df.groupby('datetime')[col].transform(rank_group)
-                original_name = str(col).replace('__CSRANK__', 'CSRank_')
-                df[original_name] = ranked
-                df = df.drop(columns=[col])
-            return df
+            # Pivot to get dates as rows and instruments as columns
+            pivot_df = df.pivot(index='datetime', columns='instrument', values='feature')
+            
+            # Apply the Numba-optimized function
+            ranked_values = cs_rank_numba(pivot_df.values)
+            
+            # Create a new DataFrame with the ranked values
+            ranked_df = pd.DataFrame(ranked_values, index=pivot_df.index, columns=pivot_df.columns)
+            
+            # Unpivot to get the original format back
+            return ranked_df.unstack().rename('CSRank_feature').reset_index()
 
         # 准备完整数据集
         full_df = self.mock_data.reset_index()
@@ -164,6 +153,30 @@ class TestRankOperators(unittest.TestCase):
         np.testing.assert_allclose(ranked_mixed.values, expected_mixed, rtol=1e-5, atol=1e-5)
 
         print("✅ TSRank测试通过")
+
+    def test_csrank_performance(self):
+        print("\n📊 CSRank性能测试")
+        n_instruments = 500
+        n_dates = 1000
+        dates = pd.date_range('2000-01-01', periods=n_dates)
+        instruments = [f'INS{i}' for i in range(n_instruments)]
+        multi_index = pd.MultiIndex.from_product([dates, instruments], names=['datetime', 'instrument'])
+        feature_data = np.random.randn(len(multi_index))
+        # Add some NaNs
+        nan_indices = np.random.choice(len(multi_index), size=int(0.1 * len(multi_index)), replace=False)
+        feature_data[nan_indices] = np.nan
+        
+        df = pd.DataFrame({'feature': feature_data}, index=multi_index).reset_index()
+        
+        # Pivot to get dates as rows and instruments as columns
+        pivot_df = df.pivot(index='datetime', columns='instrument', values='feature')
+        
+        import time
+        start = time.time()
+        _ = cs_rank_numba(pivot_df.values)
+        duration = time.time() - start
+        print(f"Numba CSRank on {n_dates}x{n_instruments} data: {duration:.4f}s")
+        self.assertLess(duration, 1.0)  # Assert that it runs in a reasonable time
 
     def test_performance(self):
         print("\n📊 性能测试")

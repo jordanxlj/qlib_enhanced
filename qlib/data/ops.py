@@ -7,12 +7,57 @@ from __future__ import print_function
 
 import numpy as np
 import pandas as pd
+import numba
 
 from typing import Union, List, Type
 from scipy.stats import percentileofscore, rankdata
 from .base import Expression, ExpressionOps, Feature, PFeature
 from ..log import get_module_logger
 from ..utils import get_callable_kwargs
+
+# Numba-optimized cross-sectional rank function
+@numba.jit(nopython=True)
+def cs_rank_numba(data):
+    # Assuming data is a 2D array where each row is a date and each column is an asset
+    ranked_data = np.full_like(data, np.nan, dtype=np.float64)
+    for i in range(data.shape[0]):
+        row = data[i, :]
+        valid_indices = ~np.isnan(row)
+        valid_data = row[valid_indices]
+        
+        if len(valid_data) > 0:
+            # Sort the data to handle ranks
+            sorter = np.argsort(valid_data)
+            inv_sorter = np.empty_like(sorter)
+            inv_sorter[sorter] = np.arange(len(valid_data))
+
+            sorted_data = valid_data[sorter]
+            ranks = np.empty(len(valid_data), dtype=np.float64)
+            
+            # Manually handle ties
+            obs = sorted_data
+            dense = np.empty(len(valid_data), dtype=np.int64)
+            if len(valid_data) > 0:
+                dense[0] = 1
+                for k in range(1, len(valid_data)):
+                    if obs[k] == obs[k - 1]:
+                        dense[k] = dense[k - 1]
+                    else:
+                        dense[k] = dense[k - 1] + 1
+            
+            # Calculate average rank for ties
+            count = np.bincount(dense)[1:]
+            cumsum = np.cumsum(count)
+            sum_ranks = (cumsum * (cumsum + 1)) / 2.0
+            avg_ranks = (sum_ranks - np.hstack((np.array([0.0]), sum_ranks[:-1]))) / count
+            
+            ranks = avg_ranks[dense - 1]
+            
+            # Put ranks back in original order and normalize
+            final_ranks = ranks[inv_sorter]
+            ranked_data[i, valid_indices] = final_ranks / len(valid_data)
+            
+    return ranked_data
 
 try:
     from ._libs.rolling import rolling_slope, rolling_rsquare, rolling_resi
@@ -1583,11 +1628,9 @@ class CSRank(ExpressionOps):
         return f"CSRank({self.feature})"
 
     def _load_internal(self, instrument, start_index, end_index, *args):
-        # CSRank cannot be computed for individual instruments since it requires cross-sectional data
-        # For now, return the raw feature values and let a data processor handle cross-sectional ranking
+        # This method is now simplified to indicate that it requires special handling.
+        # The actual ranking is done in a data processing step that can aggregate the data.
         series = self.feature.load(instrument, start_index, end_index, *args)
-        
-        # Mark this series for cross-sectional processing by adding a special name prefix
         series.name = f"__CSRANK__{str(self.feature)}"
         return series
 
