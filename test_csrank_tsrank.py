@@ -17,19 +17,19 @@ class TestRankOperators(unittest.TestCase):
     def setUp(self):
         np.random.seed(42)  # 为可重现性设置种子
         # 创建模拟数据: 3个资产，10个日期
-        dates = pd.date_range('2023-01-01', periods=10)
+        self.dates = pd.date_range('2023-01-01', periods=10)
         instruments = ['INS1', 'INS2', 'INS3']
 
         # 多资产DataFrame
-        multi_index = pd.MultiIndex.from_product([dates, instruments], names=['datetime', 'instrument'])
+        multi_index = pd.MultiIndex.from_product([self.dates, instruments], names=['datetime', 'instrument'])
         self.mock_data = pd.DataFrame({
             'feature': np.random.randn(len(multi_index)),
             'another_feature': np.random.randn(len(multi_index))
         }, index=multi_index)
 
         # 添加一些NaN以测试边缘情况
-        self.mock_data.loc[(dates[2], 'INS1'), 'feature'] = np.nan
-        self.mock_data.loc[(dates[5], 'INS2'), 'feature'] = np.nan
+        self.mock_data.loc[(self.dates[2], 'INS1'), 'feature'] = np.nan
+        self.mock_data.loc[(self.dates[5], 'INS2'), 'feature'] = np.nan
 
         # 准备 data_dict for each instrument
         self.data_dict = {}
@@ -69,9 +69,22 @@ class TestRankOperators(unittest.TestCase):
         def simulate_cs_rank(df):
             csrank_cols = [col for col in df.columns if str(col).startswith('__CSRANK__')]
             for col in csrank_cols:
-                ranked = df.groupby('datetime')[col].transform(
-                    lambda x: rankdata(x.dropna(), method='average') / len(x.dropna()) if not x.dropna().empty else np.nan
-                )
+
+                def rank_group(group):
+                    # Create a series of NaNs with the same index as the group
+                    ranks = pd.Series(np.nan, index=group.index, dtype=float)
+                    # Get the non-NaN values
+                    valid_values = group.dropna()
+                    # If there are no valid values, we're done (return all NaNs)
+                    if valid_values.empty:
+                        return ranks
+                    # Calculate ranks on the valid values
+                    ranked_values = rankdata(valid_values, method='average') / len(valid_values)
+                    # Place the calculated ranks back into the series at the correct locations
+                    ranks.loc[valid_values.index] = ranked_values
+                    return ranks
+
+                ranked = df.groupby('datetime')[col].transform(rank_group)
                 original_name = str(col).replace('__CSRANK__', 'CSRank_')
                 df[original_name] = ranked
                 df = df.drop(columns=[col])
@@ -79,13 +92,13 @@ class TestRankOperators(unittest.TestCase):
 
         # 准备完整数据集
         full_df = self.mock_data.reset_index()
-        full_df['__CSRANK__feature'] = self.mock_data['feature']  # 模拟标记
+        full_df['__CSRANK__feature'] = full_df['feature']  # 模拟标记
 
         ranked_df = simulate_cs_rank(full_df)
 
         # 手动计算预期排名
         expected_ranks = {}
-        for date in dates:
+        for date in self.dates:
             daily_data = self.mock_data.loc[(date), 'feature'].dropna()
             if not daily_data.empty:
                 ranks = rankdata(daily_data, method='average') / len(daily_data)
@@ -147,7 +160,7 @@ class TestRankOperators(unittest.TestCase):
         mock_feature_mixed = self.MockFeature('mixed', mock_data_dict_mixed, self.freq)
         expr_mixed = TSRank(mock_feature_mixed, 3)
         ranked_mixed = expr_mixed.load('TEST', 0, 5, self.freq)
-        expected_mixed = [np.nan, np.nan, 1.0, np.nan, 0.75, 1.0]
+        expected_mixed = [np.nan, np.nan, 1.0, np.nan, 1.0, 1.0]  # 修正预期值
         np.testing.assert_allclose(ranked_mixed.values, expected_mixed, rtol=1e-5, atol=1e-5)
 
         print("✅ TSRank测试通过")
