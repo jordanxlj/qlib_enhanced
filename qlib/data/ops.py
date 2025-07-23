@@ -1619,14 +1619,42 @@ class TSRank(Rolling):
     def _load_internal(self, instrument, start_index, end_index, *args):
         series = self.feature.load(instrument, start_index, end_index, *args)
         
-        # For TSRank, we apply rolling rank on the time series for this single instrument
-        # No need to group by instrument since we're already processing one instrument at a time
-        def rolling_rank_func(x):
-            if len(x) == 0:
-                return np.nan
-            return rankdata(x, method='average')[-1] / len(x)
+        if len(series) == 0:
+            return pd.Series(np.nan, index=series.index)
+        
+        # Try to use numba for optimization
+        try:
+            from numba import jit
+            @jit(nopython=True)
+            def rolling_rank_func(x):
+                valid = x[~np.isnan(x)]
+                if len(valid) == 0:
+                    return np.nan
+                last = x[-1]
+                if np.isnan(last):
+                    return np.nan
+                less = np.sum(valid < last)
+                equal = np.sum(valid == last)
+                rank = less + (equal + 1) / 2.0
+                return rank / len(valid)
+            jitted = True
+        except ImportError:
+            def rolling_rank_func(x):
+                valid = x[~np.isnan(x)]
+                if len(valid) == 0:
+                    return np.nan
+                last = x[-1]
+                if np.isnan(last):
+                    return np.nan
+                less = np.sum(valid < last)
+                equal = np.sum(valid == last)
+                rank = less + (equal + 1) / 2.0
+                return rank / len(valid)
+            jitted = False
         
         ranked_series = series.rolling(self.N, min_periods=1).apply(rolling_rank_func, raw=True)
+        if jitted:
+            print("Using Numba-optimized TSRank")
         return ranked_series
 
 
