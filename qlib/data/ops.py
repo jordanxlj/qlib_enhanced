@@ -1696,8 +1696,8 @@ class TSRank(Rolling):
             jitted = False
         
         ranked_series = series.rolling(self.N, min_periods=1).apply(rolling_rank_func, raw=True)
-        if jitted:
-            print("Using Numba-optimized TSRank")
+        #if jitted:
+        #    print("Using Numba-optimized TSRank")
         return ranked_series
 
 
