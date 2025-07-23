@@ -200,20 +200,18 @@ class CSI300PerformanceTester:
                              start_time: str = "2020-01-01", 
                              end_time: str = "2020-03-01") -> List[Dict]:
         """测试Alpha表达式性能"""
-        
-        alpha_features = [
-            ("(-1 * Corr(CSRank(Delta(Log($volume), 1)), CSRank((($close - $open) / $open)), 6))", "ALPHA1"),
-            ("(-1 * Delta((($close - $low) - ($high - $close)) / ($high - $low), 1))", "ALPHA2"),
-            ("Sum(If($close == Ref($close,1), 0, $close - If($close > Ref($close,1), Less($low, Ref($close,1)), Greater($high, Ref($close,1)))), 6)", "ALPHA3"),
-            ("If((Sum($close,8)/8 + Std($close,8)) < (Sum($close,2)/2), -1, If((Sum($close,2)/2) < (Sum($close,8)/8 - Std($close,8)), 1, If(($volume / Mean($volume,20)) >= 1, 1, -1)))", "ALPHA4"),
-            ("-1 * Corr(TSRank($volume,5), TSRank($high,5),5)", "ALPHA5"),
-            ("(CSRank(Sign(Delta((($open * 0.85) + ($high * 0.15)), 4))) * -1)", "ALPHA6"),
-            ("(CSRank(Greater(($vwap - $close), 3)) + CSRank(Min(($vwap - $close), 3))) * CSRank(Delta($volume, 3))", "ALPHA7"),
-            ("CSRank(Delta((((($high + $low)/2) * 0.2) + ($vwap * 0.8)), 4) * -1)", "ALPHA8"),
-            ("EMA((((($high + $low)/2) - ((Ref($high,1) + Ref($low,1))/2)) * (($high - $low)/$volume)), 4)", "ALPHA9"),
-            ("CSRank(Greater(Power(If(($close / Ref($close, 1)) - 1 < 0, Std(($close / Ref($close, 1)) - 1, 20), $close), 2), 5))", "ALPHA10"),
-        ]
-        
+
+        # 读取配置文件
+        config_path = "examples/benchmarks/LightGBM/workflow_config_lightgbm_Alpha55.yaml"
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+
+        feature_config = config['task']['dataset']['kwargs']['handler']['kwargs']['data_loader']['kwargs']['config']['feature']
+        features = feature_config[0]  # 特征表达式列表
+        names = feature_config[1]     # 特征名称列表
+
+        print(f"📊 开始测试 {len(features)} 个特征表达式...\n")
+
         print(f"\n🚀 测试Alpha表达式性能")
         print(f"📊 股票数量: {len(instruments)}")
         print(f"📅 时间范围: {start_time} 到 {end_time}")
@@ -221,8 +219,8 @@ class CSI300PerformanceTester:
         
         results = []
         
-        for i, (feature_expr, feature_name) in enumerate(alpha_features):
-            print(f"\n[{i+1:2d}/{len(alpha_features)}] 测试: {feature_name}")
+        for i, (feature_expr, feature_name) in enumerate(zip(features, names)):
+            print(f"\n[{i+1:2d}/{len(features)}] 测试: {feature_name}")
             print(f"   表达式: {feature_expr}")
             
             result = self._test_single_expression(
