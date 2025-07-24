@@ -18,8 +18,8 @@ port_analysis_config: &port_analysis_config
         module_path: qlib.contrib.strategy
         kwargs:
             signal: <PRED>
-            topk: 10
-            n_drop: 1
+            topk: 50
+            n_drop: 5
     backtest:
         start_time: 2023-01-01
         end_time: 2025-07-01

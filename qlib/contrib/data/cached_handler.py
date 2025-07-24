@@ -32,9 +32,8 @@ class CachedDataHandlerMixin:
             str(getattr(self, 'fit_start_time', 'unknown')),
             str(getattr(self, 'fit_end_time', 'unknown')),
             str(sorted(getattr(self, 'instruments', [])) if hasattr(self, 'instruments') and getattr(self, 'instruments', None) else 'all'),
-            str(getattr(self, 'infer_processors', [])),
-            str(getattr(self, 'learn_processors', [])),
         ]
+        print(f"key_components={key_components}")
         
         key_str = '_'.join(key_components)
         return hashlib.md5(key_str.encode()).hexdigest() + '.pkl'
@@ -57,42 +56,39 @@ class CachedDataHandlerMixin:
         cache_path = os.path.join(self.cache_dir, self.cache_key)
         
         if os.path.exists(cache_path):
-            print(f"🔄 从缓存加载数据: {os.path.basename(cache_path)}")
+            print(f"load from cache: {os.path.basename(cache_path)}")
             try:
                 with open(cache_path, 'rb') as f:
                     cached_data = pickle.load(f)
                 
                 # 恢复缓存的数据
-                self._data = cached_data.get('_data')
-                if hasattr(self, '_infer'):
-                    self._infer = cached_data.get('_infer')
-                if hasattr(self, '_learn'):
-                    self._learn = cached_data.get('_learn')
+                for attr, value in cached_data.items():
+                    setattr(self, attr, value)
                 
-                print(f"✅ 缓存加载成功，数据形状: {self._data.shape if self._data is not None else 'None'}")
+                print(f"load successfully, data shape: {self._data.shape if self._data is not None else 'None'}")
                 return
                 
             except Exception as e:
-                print(f"⚠️  缓存加载失败，重新计算: {str(e)}")
+                print(f"load failed, recaculate: {str(e)}")
         
         # 缓存不存在或加载失败，重新计算
-        print(f"🔧 重新计算数据并缓存到: {os.path.basename(cache_path)}")
+        print(f"caculate and cache into: {os.path.basename(cache_path)}")
         super().setup_data(*args, **kwargs)
         
         # 保存到缓存
         try:
             cache_data = {'_data': self._data}
-            if hasattr(self, '_infer'):
-                cache_data['_infer'] = self._infer
-            if hasattr(self, '_learn'):
-                cache_data['_learn'] = self._learn
-                
+            # 保存所有相关的数据属性
+            for attr in ['_infer', '_learn']:
+                if hasattr(self, attr):
+                    cache_data[attr] = getattr(self, attr)
+                    
             with open(cache_path, 'wb') as f:
                 pickle.dump(cache_data, f)
-            print(f"💾 数据已缓存，文件大小: {os.path.getsize(cache_path) / 1024 / 1024:.1f}MB")
+            print(f"data is already cached into {cache_path}，file size: {os.path.getsize(cache_path) / 1024 / 1024:.1f}MB")
             
         except Exception as e:
-            print(f"⚠️  缓存保存失败: {str(e)}")
+            print(f"cache failed: {str(e)}")
 
 
 class CachedAlpha158(CachedDataHandlerMixin, Alpha158):
