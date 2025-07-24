@@ -15,7 +15,7 @@ import scipy.stats as stats  # 新增：用于计算相关性（IC）
 
 # 命令行参数解析
 parser = argparse.ArgumentParser(description='Simple LightGBM script for train or eval.')
-parser.add_argument('--mode', type=str, default='train', choices=['train', 'eval'], help='Mode: train or eval')
+parser.add_argument('--mode', type=str, default='train', choices=['train', 'eval', 'factor'], help='Mode: train or eval')
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -35,8 +35,8 @@ if __name__ == '__main__':
             'fit_start_time': '2010-01-01',
             'fit_end_time': '2019-12-31',
             # 先注释processors，测试最小配置
-            # 'infer_processors': [{'class': 'ZScoreNorm'}, {'class': 'Fillna'}],
-            # 'learn_processors': [{'class': 'DropnaLabel'}, {'class': 'CSRankNorm', 'kwargs': {'fields_group': 'label'}}]
+            'infer_processors': [{'class': 'ZScoreNorm'}, {'class': 'Fillna'}],
+            'learn_processors': [{'class': 'DropnaLabel'}, {'class': 'CSRankNorm', 'kwargs': {'fields_group': 'label'}}]
         }
     }
 
@@ -63,7 +63,7 @@ if __name__ == '__main__':
         raise ValueError("Dataset不是DatasetH类型，请检查配置或Qlib版本！")
 
     # 定义测试时间段（移到这里，确保全局可用）
-    test_start, test_end = pd.Timestamp('2023-01-01'), pd.Timestamp('2025-07-15')
+    test_start, test_end = pd.Timestamp('2023-01-01'), pd.Timestamp('2025-07-01')
 
     # 定义模型配置
     model_config = {
@@ -131,7 +131,6 @@ if __name__ == '__main__':
         except FileNotFoundError:
             print("predictions.pkl不存在，重新预测...")
             # 手动提取测试特征（同train模式）
-            import pdb; pdb.set_trace()
             test_df = handler.fetch(data_key=DataHandlerLP.DK_I)
             test_df = test_df.loc[(test_df.index.get_level_values('datetime') >= test_start) &
                                   (test_df.index.get_level_values('datetime') <= test_end)]
@@ -144,78 +143,120 @@ if __name__ == '__main__':
         print("预测结果样本：")
         print(pred.head())
 
-    # 新增：IC分析（Information Coefficient）
-    print("\n开始IC分析...")
-    # 手动提取测试集实际标签（DK_L: 学习数据，包含标签）
-    test_label_df = handler.fetch(data_key=DataHandlerLP.DK_L)  # 获取带标签的数据
-    test_label_df = test_label_df.loc[(test_label_df.index.get_level_values('datetime') >= test_start) &
-                                      (test_label_df.index.get_level_values('datetime') <= test_end)]
+        # 新增：IC分析（Information Coefficient）
+        print("\n开始IC分析...")
+        # 手动提取测试集实际标签（DK_L: 学习数据，包含标签）
+        test_label_df = handler.fetch(data_key=DataHandlerLP.DK_L)  # 获取带标签的数据
+        test_label_df = test_label_df.loc[(test_label_df.index.get_level_values('datetime') >= test_start) &
+                                          (test_label_df.index.get_level_values('datetime') <= test_end)]
 
-    # 假设标签列是'LABEL0'（实际回报）
-    actual = test_label_df.get('LABEL0', pd.Series())  # 获取实际回报Series
+        # 假设标签列是'LABEL0'（实际回报）
+        actual = test_label_df.get('LABEL0', pd.Series())  # 获取实际回报Series
 
-    # 对齐pred和actual（确保相同索引）
-    common_index = pred.index.intersection(actual.index)
-    pred_aligned = pred.loc[common_index]
-    actual_aligned = actual.loc[common_index]
+        # 对齐pred和actual（确保相同索引）
+        common_index = pred.index.intersection(actual.index)
+        pred_aligned = pred.loc[common_index]
+        actual_aligned = actual.loc[common_index]
 
-    # 计算整体IC（Pearson和Spearman/Rank IC）
-    ic_pearson = pred_aligned.corr(actual_aligned, method='pearson')
-    ic_spearman = pred_aligned.corr(actual_aligned, method='spearman')  # Rank IC
+        # 计算整体IC（Pearson和Spearman/Rank IC）
+        ic_pearson = pred_aligned.corr(actual_aligned, method='pearson')
+        ic_spearman = pred_aligned.corr(actual_aligned, method='spearman')  # Rank IC
 
-    print(f"整体Pearson IC: {ic_pearson:.4f}")
-    print(f"整体Spearman (Rank) IC: {ic_spearman:.4f}")
+        print(f"整体Pearson IC: {ic_pearson:.4f}")
+        print(f"整体Spearman (Rank) IC: {ic_spearman:.4f}")
 
-    # （可选）逐日IC
-    daily_ic = []
-    for date in pred_aligned.index.get_level_values('datetime').unique():
-        daily_pred = pred_aligned.xs(date, level='datetime')
-        daily_actual = actual_aligned.xs(date, level='datetime')
-        if len(daily_pred) > 1 and len(daily_actual) > 1:
-            daily_ic.append(daily_pred.corr(daily_actual, method='spearman'))
-    mean_daily_ic = np.mean(daily_ic)
-    print(f"平均逐日Rank IC: {mean_daily_ic:.4f}")
+        # （可选）逐日IC
+        daily_ic = []
+        for date in pred_aligned.index.get_level_values('datetime').unique():
+            daily_pred = pred_aligned.xs(date, level='datetime')
+            daily_actual = actual_aligned.xs(date, level='datetime')
+            if len(daily_pred) > 1 and len(daily_actual) > 1:
+                daily_ic.append(daily_pred.corr(daily_actual, method='spearman'))
+        mean_daily_ic = np.mean(daily_ic)
+        print(f"平均逐日Rank IC: {mean_daily_ic:.4f}")
 
-    # 新增：与基准比较（例如CSI300指数）
-    print("\n开始与基准比较...")
-    benchmark = 'SH000300'  # 基准：CSI300
-    bench_fields = ['Ref($close, -1) / $close - 1']  # 计算基准每日回报
-    bench_data = D.features([benchmark], bench_fields, start_time=test_start, end_time=test_end, freq='day')
-    bench_data.columns = ['bench_return']
-    bench_returns = bench_data['bench_return'].droplevel('instrument')  # 转换为Series，索引为datetime
+        # 新增：与基准比较（例如CSI300指数）
+        print("\n开始与基准比较...")
+        benchmark = 'SH000300'  # 基准：CSI300
+        bench_fields = ['Ref($close, -1) / $close - 1']  # 计算基准每日回报
+        bench_data = D.features([benchmark], bench_fields, start_time=test_start, end_time=test_end, freq='day')
+        bench_data.columns = ['bench_return']
+        bench_returns = bench_data['bench_return'].droplevel('instrument')  # 转换为Series，索引为datetime
 
-    # 简单策略回报模拟：基于pred的等权重Top50股票（示例）
-    # 逐日计算策略回报
-    strategy_returns = []
-    dates = pred.index.get_level_values('datetime').unique()
-    for date in dates:
-        daily_pred = pred.xs(date, level='datetime')
-        # 选Top50（按pred降序）
-        topk = daily_pred.nlargest(50).index
-        # 假设等权重，实际回报从actual（或加载$close计算）
-        daily_actual = actual.xs(date, level='datetime').reindex(topk)
-        if not daily_actual.empty:
-            strategy_returns.append(daily_actual.mean())  # 等权重平均回报
-        else:
-            strategy_returns.append(0.0)
-    strategy_returns = pd.Series(strategy_returns, index=dates)
+        # 简单策略回报模拟：基于pred的等权重Top50股票（示例）
+        # 逐日计算策略回报
+        strategy_returns = []
+        dates = pred.index.get_level_values('datetime').unique()
+        for date in dates:
+            daily_pred = pred.xs(date, level='datetime')
+            # 选Top50（按pred降序）
+            topk = daily_pred.nlargest(50).index
+            # 假设等权重，实际回报从actual（或加载$close计算）
+            daily_actual = actual.xs(date, level='datetime').reindex(topk)
+            if not daily_actual.empty:
+                strategy_returns.append(daily_actual.mean())  # 等权重平均回报
+            else:
+                strategy_returns.append(0.0)
+        strategy_returns = pd.Series(strategy_returns, index=dates)
 
-    # 计算累计回报
-    cum_strategy = (1 + strategy_returns).cumprod()
-    cum_bench = (1 + bench_returns).cumprod()
+        # 计算累计回报
+        cum_strategy = (1 + strategy_returns).cumprod()
+        cum_bench = (1 + bench_returns).cumprod()
 
-    # 打印比较
-    print("策略累计回报（测试期末）:", cum_strategy.iloc[-1])
-    print("基准累计回报（测试期末）:", cum_bench.iloc[-1])
-    print("策略年化回报:", (cum_strategy.iloc[-1] ** (252 / len(strategy_returns)) - 1))  # 假设252交易日
-    print("基准年化回报:", (cum_bench.iloc[-1] ** (252 / len(bench_returns)) - 1))
+        # 打印比较
+        print("策略累计回报（测试期末）:", cum_strategy.iloc[-1])
+        print("基准累计回报（测试期末）:", cum_bench.iloc[-1])
+        print("策略年化回报:", (cum_strategy.iloc[-1] ** (252 / len(strategy_returns)) - 1))  # 假设252交易日
+        print("基准年化回报:", (cum_bench.iloc[-1] ** (252 / len(bench_returns)) - 1))
 
-    # （可选）保存比较数据
-    comparison_df = pd.DataFrame({'strategy_cum': cum_strategy, 'bench_cum': cum_bench})
-    comparison_df.to_csv('return_comparison.csv')
+        # （可选）保存比较数据
+        comparison_df = pd.DataFrame({'strategy_cum': cum_strategy, 'bench_cum': cum_bench})
+        comparison_df.to_csv('return_comparison.csv')
 
-    # 手动保存模型或预测（使用pickle）
-    print("保存模型和预测...")
-    with open('lightgbm_model.pkl', 'wb') as f:
-        pickle.dump(model, f)  # 保存整个Qlib模型对象
-    pred.to_pickle('predictions.pkl')  # 保存预测
+    elif args.mode == 'factor':
+        # 独立模式：仅执行因子IC分析
+        print("\n开始因子IC分析 (每个Alpha158因子 vs LABEL0)...")
+
+        # 手动提取测试集实际标签（DK_L: 学习数据，包含标签）
+        test_label_df = handler.fetch(data_key=DataHandlerLP.DK_L)  # 获取带标签的数据
+        test_label_df = test_label_df.loc[(test_label_df.index.get_level_values('datetime') >= test_start) &
+                                          (test_label_df.index.get_level_values('datetime') <= test_end)]
+
+        # 假设标签列是'LABEL0'（实际回报）
+        actual = test_label_df.get('LABEL0', pd.Series())  # 获取实际回报Series
+
+        # 使用test_label_df（包含特征和标签）
+        label_col = 'LABEL0'  # 假设标签列
+        factor_cols = [col for col in test_label_df.columns if col != label_col]  # 所有因子列
+
+        factor_ic_results = []
+        for factor in factor_cols:
+            factor_series = test_label_df[factor]
+
+            # 对齐因子和actual
+            common_index = factor_series.index.intersection(actual.index)
+            factor_aligned = factor_series.loc[common_index]
+            actual_aligned = actual.loc[common_index]
+
+            # 计算IC
+            if len(factor_aligned) > 1 and len(actual_aligned) > 1:
+                pearson_ic = factor_aligned.corr(actual_aligned, method='pearson')
+                spearman_ic = factor_aligned.corr(actual_aligned, method='spearman')
+                factor_ic_results.append({
+                    'factor': factor,
+                    'pearson_ic': pearson_ic,
+                    'spearman_ic': spearman_ic
+                })
+            else:
+                print(f"跳过因子 {factor}: 数据点不足")
+
+        # 转换为DataFrame并排序（按Spearman IC降序）
+        ic_df = pd.DataFrame(factor_ic_results)
+        ic_df = ic_df.sort_values(by='spearman_ic', ascending=False)
+
+        # 打印结果
+        print("因子IC分析结果（按Spearman IC降序）：")
+        print(ic_df)
+
+        # （可选）保存到CSV
+        ic_df.to_csv('factor_ic_analysis.csv', index=False)
