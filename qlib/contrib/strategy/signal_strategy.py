@@ -260,6 +260,7 @@ class TopkDropoutStrategy(BaseSignalStrategy):
                     )
                     # update cash
                     cash += trade_val - trade_cost
+                    #print(f"sell order {code}, amount {sell_amount}, start {trade_start_time}, end {trade_end_time}, cash {cash}")
         # buy new stock
         # note the current has been changed
         # current_stock_list = current_temp.get_stock_list()
@@ -292,6 +293,7 @@ class TopkDropoutStrategy(BaseSignalStrategy):
                 direction=Order.BUY,  # 1 for buy
             )
             buy_order_list.append(buy_order)
+            #print(f"buy order {code}, amount {buy_amount}, start {trade_start_time}, end {trade_end_time}, value {value}")
         return TradeDecisionWO(sell_order_list + buy_order_list, self)
 
 

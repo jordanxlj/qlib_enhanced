@@ -9,14 +9,17 @@ data_handler_config: &data_handler_config
     fit_start_time: 2010-01-01
     fit_end_time: 2019-12-31
     instruments: *market
+    # 缓存配置
+    cache_dir: "cache"
+    enable_cache: true
 port_analysis_config: &port_analysis_config
     strategy:
         class: TopkDropoutStrategy
         module_path: qlib.contrib.strategy
         kwargs:
             signal: <PRED>
-            topk: 50
-            n_drop: 5
+            topk: 10
+            n_drop: 1
     backtest:
         start_time: 2023-01-01
         end_time: 2025-07-01
@@ -47,8 +50,8 @@ task:
         module_path: qlib.data.dataset
         kwargs:
             handler:
-                class: Alpha158
-                module_path: qlib.contrib.data.handler
+                class: CachedAlpha158  # 使用带缓存的 Alpha158
+                module_path: qlib.contrib.data.cached_handler
                 kwargs: *data_handler_config
             segments:
                 train: [2010-01-01, 2019-12-31]

@@ -6,7 +6,7 @@ import qlib
 from qlib.constant import REG_CN
 from qlib.utils import init_instance_by_config
 from qlib.data.dataset import DatasetH, DataHandlerLP  # 导入以检查类型
-from qlib.contrib.data.handler import Alpha158  # 直接导入类检查
+from qlib.contrib.data.cached_handler import CachedAlpha158  # 使用新的缓存处理器
 from qlib.contrib.model.gbdt import LGBModel
 from qlib.data import D  # 新增：用于加载基准数据
 import pandas as pd
@@ -24,16 +24,18 @@ if __name__ == '__main__':
     # 初始化Qlib（替换为你的数据路径）
     qlib.init(provider_uri='data', region=REG_CN)
 
-    # 先定义并创建handler配置（最小化：移除processors测试）
+    # 先定义并创建handler配置（使用缓存版本）
     handler_config = {
-        'class': 'Alpha158',
-        'module_path': 'qlib.contrib.data.handler',
+        'class': 'CachedAlpha158',
+        'module_path': 'qlib.contrib.data.cached_handler',
         'kwargs': {
             'instruments': 'csi300',  # 股票池
             'start_time': '2010-01-01',
             'end_time': '2025-07-01',
             'fit_start_time': '2010-01-01',
             'fit_end_time': '2019-12-31',
+            'cache_dir': 'cache',
+            'enable_cache': True,
             # 先注释processors，测试最小配置
             'infer_processors': [{'class': 'Fillna'}, {'class': 'CSRankNorm', 'kwargs': {'fields_group': 'label'}}],
             'learn_processors': [{'class': 'DropnaLabel'}, {'class': 'CSRankNorm', 'kwargs': {'fields_group': 'label'}}]
