@@ -117,9 +117,9 @@ task:
                                     'ALPHA47', 'ALPHA48', 'ALPHA49', 'ALPHA50', 'ALPHA52',
                                 ]]
                                 label: [[
-                                    '($close / Ref($close, 1)) - 1'
+                                    'Ref($close, -2)/Ref($close, -1) - 1'
                                 ], [
-                                    'RET'
+                                    'LABEL0'
                                 ]]
             segments:
                 train: [2008-01-01, 2014-12-31]

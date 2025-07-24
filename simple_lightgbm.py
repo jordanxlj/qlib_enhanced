@@ -35,7 +35,7 @@ if __name__ == '__main__':
             'fit_start_time': '2010-01-01',
             'fit_end_time': '2019-12-31',
             # 先注释processors，测试最小配置
-            'infer_processors': [{'class': 'ZScoreNorm'}, {'class': 'Fillna'}],
+            'infer_processors': [{'class': 'Fillna'}, {'class': 'CSRankNorm', 'kwargs': {'fields_group': 'label'}}],
             'learn_processors': [{'class': 'DropnaLabel'}, {'class': 'CSRankNorm', 'kwargs': {'fields_group': 'label'}}]
         }
     }
