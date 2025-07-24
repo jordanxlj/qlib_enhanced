@@ -1,5 +1,6 @@
 import multiprocessing  # 用于Windows多进程修复
 import pickle  # 新增：用于手动保存模型
+import argparse  # 新增：用于命令行参数解析
 
 import qlib
 from qlib.constant import REG_CN
@@ -11,6 +12,11 @@ from qlib.data import D  # 新增：用于加载基准数据
 import pandas as pd
 import numpy as np  # 用于手动预测和计算
 import scipy.stats as stats  # 新增：用于计算相关性（IC）
+
+# 命令行参数解析
+parser = argparse.ArgumentParser(description='Simple LightGBM script for train or eval.')
+parser.add_argument('--mode', type=str, default='train', choices=['train', 'eval'], help='Mode: train or eval')
+args = parser.parse_args()
 
 if __name__ == '__main__':
     multiprocessing.freeze_support()  # Windows多进程修复
@@ -24,10 +30,10 @@ if __name__ == '__main__':
         'module_path': 'qlib.contrib.data.handler',
         'kwargs': {
             'instruments': 'csi300',  # 股票池
-            'start_time': '2008-01-01',
-            'end_time': '2020-08-01',
-            'fit_start_time': '2008-01-01',
-            'fit_end_time': '2014-12-31',
+            'start_time': '2010-01-01',
+            'end_time': '2025-07-01',
+            'fit_start_time': '2010-01-01',
+            'fit_end_time': '2019-12-31',
             # 先注释processors，测试最小配置
             # 'infer_processors': [{'class': 'ZScoreNorm'}, {'class': 'Fillna'}],
             # 'learn_processors': [{'class': 'DropnaLabel'}, {'class': 'CSRankNorm', 'kwargs': {'fields_group': 'label'}}]
@@ -46,15 +52,18 @@ if __name__ == '__main__':
 
     # 现在创建dataset，传入handler和segments
     dataset = DatasetH(handler=handler, segments={
-        'train': ('2008-01-01', '2014-12-31'),
-        'valid': ('2015-01-01', '2016-12-31'),
-        'test': ('2017-01-01', '2020-08-01')
+        'train': ('2010-01-01', '2019-12-31'),
+        'valid': ('2020-01-01', '2022-12-31'),
+        'test': ('2023-01-01', '2025-07-01')
     })
 
     # 调试：打印dataset类型
     print(f"Type of dataset: {type(dataset)}")  # 预期: <class 'qlib.data.dataset.DatasetH'>
     if not isinstance(dataset, DatasetH):
         raise ValueError("Dataset不是DatasetH类型，请检查配置或Qlib版本！")
+
+    # 定义测试时间段（移到这里，确保全局可用）
+    test_start, test_end = pd.Timestamp('2023-01-01'), pd.Timestamp('2025-07-15')
 
     # 定义模型配置
     model_config = {
@@ -73,36 +82,67 @@ if __name__ == '__main__':
         }
     }
 
-    # 创建模型实例
-    model = init_instance_by_config(model_config)
+    if args.mode == 'train':
+        # 创建模型实例
+        model = init_instance_by_config(model_config)
 
-    # 训练模型
-    print("开始训练...")
-    model.fit(dataset)  # 这会自动处理数据准备、特征计算和训练
+        # 训练模型
+        print("开始训练...")
+        model.fit(dataset)  # 这会自动处理数据准备、特征计算和训练
 
-    # 调试：在predict前再次检查类型（如果这里变了，说明fit修改了dataset）
-    print(f"Type of dataset after fit: {type(dataset)}")
+        # 调试：在predict前再次检查类型（如果这里变了，说明fit修改了dataset）
+        print(f"Type of dataset after fit: {type(dataset)}")
 
-    # 预测（默认使用workaround绕过prepare问题）
-    print("开始预测...")
-    # 手动提取测试特征（DK_I: 推理数据，仅特征）
-    test_df = handler.fetch(data_key=DataHandlerLP.DK_I)  # 获取所有推理数据
-    # 过滤测试时间段（假设索引是MultiIndex with datetime）
-    test_start, test_end = pd.Timestamp('2017-01-01'), pd.Timestamp('2020-08-01')
-    test_df = test_df.loc[(test_df.index.get_level_values('datetime') >= test_start) &
-                          (test_df.index.get_level_values('datetime') <= test_end)]
+        # 预测（默认使用workaround绕过prepare问题）
+        print("开始预测...")
+        # 手动提取测试特征（DK_I: 推理数据，仅特征）
+        test_df = handler.fetch(data_key=DataHandlerLP.DK_I)  # 获取所有推理数据
+        test_df = test_df.loc[(test_df.index.get_level_values('datetime') >= test_start) &
+                              (test_df.index.get_level_values('datetime') <= test_end)]
 
-    # 假设特征列是除标签外的所有列（根据你的handler，排除LABEL0，如果存在）
-    feature_cols = [col for col in test_df.columns if col != 'LABEL0']  # 调整为你的标签列（如果有）
-    X_test = test_df[feature_cols].values  # 转换为numpy array
+        # 假设特征列是除标签外的所有列（根据你的handler，排除LABEL0，如果存在）
+        feature_cols = [col for col in test_df.columns if col != 'LABEL0']  # 调整为你的标签列（如果有）
+        X_test = test_df[feature_cols].values  # 转换为numpy array
 
-    # 使用模型的底层LightGBM预测
-    pred_array = model.model.predict(X_test)  # model.model是底层lgb.Booster
-    pred = pd.Series(pred_array, index=test_df.index)  # 转换为Series
+        # 使用模型的底层LightGBM预测
+        pred_array = model.model.predict(X_test)  # model.model是底层lgb.Booster
+        pred = pd.Series(pred_array, index=test_df.index)  # 转换为Series
 
-    # 查看预测结果（可选：保存或分析）
-    print("预测结果样本：")
-    print(pred.head())
+        # 查看预测结果（可选：保存或分析）
+        print("预测结果样本：")
+        print(pred.head())
+
+        # 手动保存模型或预测（使用pickle）
+        print("保存模型和预测...")
+        with open('lightgbm_model.pkl', 'wb') as f:
+            pickle.dump(model, f)  # 保存整个Qlib模型对象
+        pred.to_pickle('predictions.pkl')  # 保存预测
+
+    elif args.mode == 'eval':
+        # 加载已保存的模型
+        print("加载模型...")
+        with open('lightgbm_model.pkl', 'rb') as f:
+            model = pickle.load(f)
+
+        # 加载或重新计算预测（如果predictions.pkl存在，加载；否则重新预测）
+        try:
+            pred = pd.read_pickle('predictions.pkl')
+            print("加载现有预测...")
+        except FileNotFoundError:
+            print("predictions.pkl不存在，重新预测...")
+            # 手动提取测试特征（同train模式）
+            import pdb; pdb.set_trace()
+            test_df = handler.fetch(data_key=DataHandlerLP.DK_I)
+            test_df = test_df.loc[(test_df.index.get_level_values('datetime') >= test_start) &
+                                  (test_df.index.get_level_values('datetime') <= test_end)]
+            feature_cols = [col for col in test_df.columns if col != 'LABEL0']
+            X_test = test_df[feature_cols].values
+            pred_array = model.model.predict(X_test)
+            pred = pd.Series(pred_array, index=test_df.index)
+            pred.to_pickle('predictions.pkl')  # 保存以备后用
+
+        print("预测结果样本：")
+        print(pred.head())
 
     # 新增：IC分析（Information Coefficient）
     print("\n开始IC分析...")
