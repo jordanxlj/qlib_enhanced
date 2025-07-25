@@ -9,7 +9,6 @@ data_handler_config: &data_handler_config
     fit_start_time: 2010-01-01
     fit_end_time: 2019-12-31
     instruments: *market
-    # 缓存配置
     cache_dir: "cache"
     enable_cache: true
 port_analysis_config: &port_analysis_config
@@ -50,7 +49,7 @@ task:
         module_path: qlib.data.dataset
         kwargs:
             handler:
-                class: CachedAlpha158  # 使用带缓存的 Alpha158
+                class: CachedAlpha158
                 module_path: qlib.contrib.data.cached_handler
                 kwargs: *data_handler_config
             segments:
