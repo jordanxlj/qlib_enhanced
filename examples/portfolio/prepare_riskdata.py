@@ -14,7 +14,7 @@ def prepare_data(riskdata_root="./riskdata", T=240, start_time="2022-01-01"):
     price_all = (
         D.features(D.instruments("all"), ["$close"], start_time=start_time).squeeze().unstack(level="instrument")
     )
-
+    import pdb; pdb.set_trace()
     # StructuredCovEstimator is a statistical risk model
     riskmodel = StructuredCovEstimator()
 
