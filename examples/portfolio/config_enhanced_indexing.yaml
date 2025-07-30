@@ -26,7 +26,7 @@ port_analysis_config: &port_analysis_config
                 f_dev: 0.04 #factor deviation limit
     backtest:
         start_time: 2023-01-01
-        end_time: 2023-07-01
+        end_time: 2025-07-01
         account: 100000000
         benchmark: *benchmark
         exchange_kwargs:
@@ -60,7 +60,7 @@ task:
             segments:
                 train: [2010-01-01, 2019-12-31]
                 valid: [2020-01-01, 2022-12-31]
-                test: [2023-01-01, 2023-07-01]
+                test: [2023-01-01, 2025-07-01]
     record:
         - class: SignalRecord
           module_path: qlib.workflow.record_temp
