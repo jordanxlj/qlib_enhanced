@@ -502,7 +502,7 @@ class EnhancedIndexingStrategy(WeightStrategyBase):
         # mask force sell
         mask_force_sell = np.array([stock in blacklist for stock in universe], dtype=bool)
 
-        print(f"score: {score.shape}, factor: {factor_exp.shape}, f_cov: {factor_cov.shape}, w0: {cur_weight.shape}, wb: {bench_weight.shape}, mfh: {mask_force_hold.shape}, mfs: {mask_force_sell.shape}")
+        #print(f"score: {score.shape}, factor: {factor_exp.shape}, f_cov: {factor_cov.shape}, w0: {cur_weight.shape}, wb: {bench_weight.shape}, mfh: {mask_force_hold.shape}, mfs: {mask_force_sell.shape}")
         # optimize
         weight = self.optimizer(
             r=score,
