@@ -20,9 +20,10 @@ port_analysis_config: &port_analysis_config
             dataset: <DATASET>
             riskmodel_root: ./riskdata
             optimizer_kwargs:
-                delta: 0.1 #total turnover limit
-                lamb: 0.9 #risk aversion parameter
-                b_dev: 0.1 #benchmark deviation limit
+                delta: 0.12 #total turnover limit
+                lamb: 1.5 #risk aversion parameter
+                b_dev: 0.06 #benchmark deviation limit
+                f_dev: 0.04 #factor deviation limit
     backtest:
         start_time: 2023-01-01
         end_time: 2023-07-01
