@@ -316,7 +316,7 @@ def create_portfolio_calendar(recorder):
             all_instruments.update(pos.position.keys())
 
     # 批量获取所有价格
-    price_df = D.features(list(all_instruments), ['$close'], start_time=min(all_dates), end_time=max(all_dates), freq='day') if all_instruments else pd.DataFrame()
+    #price_df = D.features(list(all_instruments), ['$close'], start_time=min(all_dates), end_time=max(all_dates), freq='day') if all_instruments else pd.DataFrame()
 
     for date in all_dates:
         pos = positions[date]
@@ -324,11 +324,16 @@ def create_portfolio_calendar(recorder):
         if hasattr(pos, 'position') and isinstance(pos.position, dict):
             instruments = sorted(pos.position.keys())
             formatted = []
-            date_prices = price_df.loc[pd.IndexSlice[:, date], '$close'] if not price_df.empty and (slice(None), date) in price_df.index else pd.Series()
+            # if not price_df.empty and date in price_df.index.get_level_values(1):
+            #     date_prices = price_df.loc[pd.IndexSlice[:, date], '$close']
+            # else:
+            #     date_prices = pd.Series()
             for inst in instruments:
-                amount = pos.position[inst]
-                price = date_prices.get(inst, 0.0)
-                formatted.append(f"{inst}: price: {price:.2f} shares: {amount:.2f}")
+                if inst == 'cash' or inst == 'now_account_value':
+                    continue
+                amount = pos.position[inst]['amount']
+                price = pos.position[inst]['price']
+                formatted.append(f"{inst}: price: {price:.2f} shares: {amount:.0f}")
             pos_str = '<br>'.join(formatted) if formatted else 'No Position'
         else:
             pos_str = 'No Position'
