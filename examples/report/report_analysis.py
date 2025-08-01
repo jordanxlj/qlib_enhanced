@@ -1,5 +1,7 @@
+import multiprocessing  # 用于Windows多进程修复
 import argparse
 import qlib
+from qlib.constant import REG_CN
 from qlib.workflow import R
 from qlib.contrib.report import analysis_position, analysis_model
 import pandas as pd
@@ -10,6 +12,8 @@ from plotly.subplots import make_subplots
 import plotly.io as pio
 from scipy.stats import pearsonr, spearmanr
 from datetime import datetime
+import calendar  # For month names
+from qlib.data import D
 
 # 常量定义：颜色方案和布局设置
 COLORS = {
@@ -31,43 +35,6 @@ LEGEND_CONFIG_BASE = dict(
     font=dict(size=10)
 )
 
-parser = argparse.ArgumentParser(description="Analyze Qlib experiment recorder.")
-parser.add_argument("--exp_name", type=str, required=True, help="Experiment name")
-parser.add_argument("--rec_id", type=str, required=True, help="Recorder ID")
-args = parser.parse_args()
-
-qlib.init()
-
-try:
-    recorder = R.get_recorder(experiment_id=args.exp_name, recorder_id=args.rec_id)
-except ValueError as e:
-    print(f"Error: {e}")
-    print("Available experiments:")
-    for exp_name in R.list_experiments():
-        print(exp_name)
-    raise
-
-# 加载数据
-pred_df = recorder.load_object("pred.pkl")
-label_df = recorder.load_object("label.pkl")
-
-# 打印原始形状以调试
-print(f"pred_df shape: {pred_df.shape}")
-print(f"label_df shape: {label_df.shape}")
-
-# 合并数据
-pred_label = pd.concat([pred_df, label_df], axis=1, keys=['score', 'label']).reindex(label_df.index)
-
-# 修复 MultiIndex：扁平化列名
-pred_label.columns = ['_'.join(col).strip() if isinstance(col, tuple) else col for col in pred_label.columns]
-
-# 确保'score'和'label'列存在
-if 'score' not in pred_label.columns or 'label' not in pred_label.columns:
-    pred_label = pred_label.rename(columns={pred_label.columns[0]: 'score', pred_label.columns[-1]: 'label'})
-
-# 打印修复后形状和列以验证
-print(f"pred_label shape after fix: {pred_label.shape}")
-print(f"pred_label columns: {pred_label.columns.tolist()}")
 
 def add_cumulative_returns(fig, report_df, row, col, legend_group):
     """添加累积收益对比曲线到子图"""
@@ -331,58 +298,47 @@ def combine_model_figures(model_figures):
 
     return fig_combined
 
-# Model analysis
-print("📊 正在生成模型性能分析图表...")
-try:
-    model_figures = analysis_model.model_performance_graph(pred_label, show_notebook=False)
-    if isinstance(model_figures, list):
-        print(f"📈 合并 {len(model_figures)} 个图表到单列子图中...")
-        combined_fig = combine_model_figures(model_figures)
-        if combined_fig:
-            combined_fig.show()
-            pio.write_html(combined_fig, file=f'model_analysis_{args.rec_id}.html')
-            print(f"📁 模型分析图表已保存: model_analysis_{args.rec_id}.html")
-    else:
-        model_figures.show()
-        pio.write_html(model_figures, file=f'model_analysis_{args.rec_id}.html')
-        print(f"📁 模型分析图表已保存: model_analysis_{args.rec_id}.html")
-except Exception as e:
-    print(f"⚠️ 模型分析失败: {e}")
-
-# Position analysis
-print("📊 正在生成投资组合分析图表...")
-try:
-    report_df = recorder.load_object("portfolio_analysis/report_normal_1day.pkl")
-    position_fig = create_position_analysis_plots(report_df)
-    if position_fig:
-        position_fig.show()
-        pio.write_html(position_fig, file=f'position_analysis_{args.rec_id}.html')
-        print(f"📁 投资组合分析图表已保存: position_analysis_{args.rec_id}.html")
-except Exception as e:
-    print(f"⚠️ 投资组合分析失败: {e}")
-
 def create_portfolio_calendar(recorder):
-    """创建投资组合日历热力图（按年分子图，x轴为交易日，y轴为月）"""
+    '''创建投资组合日历热力图（按年分子图，x轴为交易日，y轴为月）'''
     try:
         positions = recorder.load_object("portfolio_analysis/positions_normal_1day.pkl")
     except Exception as e:
         print(f"⚠️ 加载持仓数据失败: {e}")
         return None
 
-    # 假设positions是dict: date -> dict of instrument -> amount
+    # 提取数据并为每个日期获取持仓详情
     calendar_data = []
-    for date, pos in positions.items():
-        total_value = pos.calculate_value()  # Assuming this method exists; adjust if needed
-        calendar_data.append({'date': date, 'value': total_value, 'positions': str(pos)})
+    all_dates = sorted(positions.keys())
+    all_instruments = set()
+    for date in all_dates:
+        pos = positions[date]
+        if hasattr(pos, 'position') and isinstance(pos.position, dict):
+            all_instruments.update(pos.position.keys())
+
+    # 批量获取所有价格
+    price_df = D.features(list(all_instruments), ['$close'], start_time=min(all_dates), end_time=max(all_dates), freq='day') if all_instruments else pd.DataFrame()
+
+    for date in all_dates:
+        pos = positions[date]
+        total_value = pos.position.get('now_account_value', 0)
+        if hasattr(pos, 'position') and isinstance(pos.position, dict):
+            instruments = sorted(pos.position.keys())
+            formatted = []
+            date_prices = price_df.loc[pd.IndexSlice[:, date], '$close'] if not price_df.empty and (slice(None), date) in price_df.index else pd.Series()
+            for inst in instruments:
+                amount = pos.position[inst]
+                price = date_prices.get(inst, 0.0)
+                formatted.append(f"{inst}: price: {price:.2f} shares: {amount:.2f}")
+            pos_str = '<br>'.join(formatted) if formatted else 'No Position'
+        else:
+            pos_str = 'No Position'
+        calendar_data.append({'date': date, 'value': total_value, 'positions': pos_str})
 
     df = pd.DataFrame(calendar_data)
-
-    # 转换为日历格式，限制为交易日（周一至周五）
     df['date'] = pd.to_datetime(df['date'])
     df = df[df['date'].dt.weekday < 5]  # 仅保留周一至周五
     df = df.set_index('date')
-    df = df.resample('D').ffill()  # 填充每日数据
-    df = df[df.index.weekday < 5]  # 再次过滤，确保仅交易日
+    df = df.resample('B').ffill()  # 填充交易日数据 (B for business days)
     df['year'] = df.index.year
     df['month'] = df.index.month
     df['day_of_month'] = df.index.day
@@ -391,7 +347,7 @@ def create_portfolio_calendar(recorder):
     # 按年分组创建子图
     years = df['year'].unique()
     num_years = len(years)
-    fig = make_subplots(rows=num_years, cols=1, subplot_titles=[f"Year {year}" for year in years], vertical_spacing=0.1)
+    fig = make_subplots(rows=num_years, cols=1, subplot_titles=[f"Year {year}" for year in years], vertical_spacing=0.05, shared_xaxes=True)
 
     for i, year in enumerate(years, 1):
         year_df = df[df['year'] == year]
@@ -405,37 +361,45 @@ def create_portfolio_calendar(recorder):
             month_df = year_df[year_df['month'] == month]
             for day in range(1, 6):
                 value = pivot_data.loc[month, day] if month in pivot_data.index and day in pivot_data.columns else 0
-                pos_idx = month_df.index[month_df['trading_day'] == day][0] if not month_df[month_df['trading_day'] == day].empty else None
-                pos = month_df.loc[pos_idx, 'positions'] if pos_idx else 'No Position'
+                pos_idx = month_df.index[month_df['trading_day'] == day][-1] if not month_df[month_df['trading_day'] == day].empty else None  # Use last instead of first for consistency with 'last'
+                pos = month_df.loc[pos_idx, 'positions'] if pos_idx is not None else 'No Position'
                 i_month = month - 1  # 0-based index
                 j_day = day - 1     # 0-based index
                 if 0 <= i_month < 12 and 0 <= j_day < 5:
-                    hover_text[i_month, j_day] = f"Value: {value:.2f}<br>Position: {pos}" if value > 0 else "No Data"
+                    hover_text[i_month, j_day] = f"Value: {value:.2f}<br>{pos}" if value > 0 else "No Data"
 
         # 添加热力图
         fig.add_trace(
             go.Heatmap(
                 z=pivot_data.values,
                 x=['Mon', 'Tue', 'Wed', 'Thu', 'Fri'],  # 交易日标签
-                y=[f"Month {m}" for m in range(1, 13)],  # 月份标签
+                y=[calendar.month_abbr[m] for m in range(1, 13)],  # 月份缩写，如Jan, Feb
                 colorscale='YlOrRd',
-                colorbar=dict(title="持仓价值", thickness=15, len=0.8 / num_years),
+                colorbar=dict(title="持仓价值", thickness=15, len=0.8 / num_years, yanchor="middle", y=1 - (i - 0.5) / num_years),
                 hoverongaps=False,
                 hovertext=hover_text,
-                showscale=(i == num_years)  # 仅最后一个子图显示colorbar
+                hoverinfo='text',
+                showscale=True
             ),
             row=i, col=1
         )
 
-        fig.update_xaxes(title_text="交易日", row=i, col=1)
-        fig.update_yaxes(title_text="月", row=i, col=1, autorange="reversed")
+        fig.update_xaxes(title_text="交易日", row=i, col=1, tickfont=dict(size=12))
+        fig.update_yaxes(title_text="月", row=i, col=1, autorange="reversed", tickfont=dict(size=12), gridcolor='white')
 
     fig.update_layout(
         title_text="投资组合日历热力图 (按年分子图)",
-        height=LAYOUT_HEIGHT_PER_SUBPLOT * num_years,
-        width=1000,
-        showlegend=False
+        height=max(400, LAYOUT_HEIGHT_PER_SUBPLOT * num_years),
+        width=1200,  # 增加宽度以改善比例
+        showlegend=False,
+        plot_bgcolor='rgba(240,240,240,0.8)',  # 轻微背景色提升可读性
+        margin=dict(l=80, r=80, t=50, b=50),  # 调整边距
     )
+
+    # 添加网格线
+    for i in range(1, num_years + 1):
+        fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='white', row=i, col=1)
+        fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='white', row=i, col=1)
 
     return fig
 
@@ -466,20 +430,91 @@ def create_trades_table(recorder):
 
     return fig
 
-# 投资组合日历可视化
-print("📅 生成投资组合日历...")
-calendar_fig = create_portfolio_calendar(recorder)
-if calendar_fig:
-    calendar_fig.show()
-    pio.write_html(calendar_fig, file=f'portfolio_calendar_{args.rec_id}.html')
-    print(f"📁 持仓日历已保存: portfolio_calendar_{args.rec_id}.html")
+if __name__ == '__main__':
+    multiprocessing.freeze_support()  # Windows多进程修复
 
-# 交易记录表格
-print("📋 生成交易记录表格...")
-trades_fig = create_trades_table(recorder)
-if trades_fig:
-    trades_fig.show()
-    pio.write_html(trades_fig, file=f'trades_table_{args.rec_id}.html')
-    print(f"📁 交易表格已保存: trades_table_{args.rec_id}.html")
+    parser = argparse.ArgumentParser(description="Analyze Qlib experiment recorder.")
+    parser.add_argument("--exp_name", type=str, required=True, help="Experiment name")
+    parser.add_argument("--rec_id", type=str, required=True, help="Recorder ID")
+    args = parser.parse_args()
 
-print("✅ 所有可视化完成!")
+    qlib.init(provider_uri='data', region=REG_CN)
+
+    try:
+        recorder = R.get_recorder(experiment_id=args.exp_name, recorder_id=args.rec_id)
+    except ValueError as e:
+        print(f"Error: {e}")
+        print("Available experiments:")
+        for exp_name in R.list_experiments():
+            print(exp_name)
+        raise
+
+    # 加载数据
+    pred_df = recorder.load_object("pred.pkl")
+    label_df = recorder.load_object("label.pkl")
+
+    # 打印原始形状以调试
+    print(f"pred_df shape: {pred_df.shape}")
+    print(f"label_df shape: {label_df.shape}")
+
+    # 合并数据
+    pred_label = pd.concat([pred_df, label_df], axis=1, keys=['score', 'label']).reindex(label_df.index)
+
+    # 修复 MultiIndex：扁平化列名
+    pred_label.columns = ['_'.join(col).strip() if isinstance(col, tuple) else col for col in pred_label.columns]
+
+    # 确保'score'和'label'列存在
+    if 'score' not in pred_label.columns or 'label' not in pred_label.columns:
+        pred_label = pred_label.rename(columns={pred_label.columns[0]: 'score', pred_label.columns[-1]: 'label'})
+
+    # 打印修复后形状和列以验证
+    print(f"pred_label shape after fix: {pred_label.shape}")
+    print(f"pred_label columns: {pred_label.columns.tolist()}")
+
+    # Model analysis
+    print("📊 正在生成模型性能分析图表...")
+    try:
+        model_figures = analysis_model.model_performance_graph(pred_label, show_notebook=False)
+        if isinstance(model_figures, list):
+            print(f"📈 合并 {len(model_figures)} 个图表到单列子图中...")
+            combined_fig = combine_model_figures(model_figures)
+            if combined_fig:
+                combined_fig.show()
+                pio.write_html(combined_fig, file=f'model_analysis_{args.rec_id}.html')
+                print(f"📁 模型分析图表已保存: model_analysis_{args.rec_id}.html")
+        else:
+            model_figures.show()
+            pio.write_html(model_figures, file=f'model_analysis_{args.rec_id}.html')
+            print(f"📁 模型分析图表已保存: model_analysis_{args.rec_id}.html")
+    except Exception as e:
+        print(f"⚠️ 模型分析失败: {e}")
+
+    # Position analysis
+    print("📊 正在生成投资组合分析图表...")
+    try:
+        report_df = recorder.load_object("portfolio_analysis/report_normal_1day.pkl")
+        position_fig = create_position_analysis_plots(report_df)
+        if position_fig:
+            position_fig.show()
+            pio.write_html(position_fig, file=f'position_analysis_{args.rec_id}.html')
+            print(f"📁 投资组合分析图表已保存: position_analysis_{args.rec_id}.html")
+    except Exception as e:
+        print(f"⚠️ 投资组合分析失败: {e}")
+
+    # 投资组合日历可视化
+    print("📅 生成投资组合日历...")
+    calendar_fig = create_portfolio_calendar(recorder)
+    if calendar_fig:
+        calendar_fig.show()
+        pio.write_html(calendar_fig, file=f'portfolio_calendar_{args.rec_id}.html')
+        print(f"📁 持仓日历已保存: portfolio_calendar_{args.rec_id}.html")
+
+    # 交易记录表格
+    print("📋 生成交易记录表格...")
+    trades_fig = create_trades_table(recorder)
+    if trades_fig:
+        trades_fig.show()
+        pio.write_html(trades_fig, file=f'trades_table_{args.rec_id}.html')
+        print(f"📁 交易表格已保存: trades_table_{args.rec_id}.html")
+
+    print("✅ 所有可视化完成!")
