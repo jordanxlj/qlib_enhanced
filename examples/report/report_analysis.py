@@ -5,9 +5,11 @@ from qlib.contrib.report import analysis_position, analysis_model
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import plotly.express as px
 from plotly.subplots import make_subplots
 import plotly.io as pio
 from scipy.stats import pearsonr, spearmanr
+from datetime import datetime
 
 # 常量定义：颜色方案和布局设置
 COLORS = {
@@ -360,7 +362,7 @@ except Exception as e:
     print(f"⚠️ 投资组合分析失败: {e}")
 
 def create_portfolio_calendar(recorder):
-    """创建投资组合日历热力图"""
+    """创建投资组合日历热力图（按年分子图，x轴为交易日，y轴为月）"""
     try:
         positions = recorder.load_object("portfolio_analysis/positions_normal_1day.pkl")
     except Exception as e:
@@ -375,38 +377,64 @@ def create_portfolio_calendar(recorder):
 
     df = pd.DataFrame(calendar_data)
 
-    # 使用imshow创建日历热力图
-    # 先处理数据为周-日矩阵
+    # 转换为日历格式，限制为交易日（周一至周五）
     df['date'] = pd.to_datetime(df['date'])
+    df = df[df['date'].dt.weekday < 5]  # 仅保留周一至周五
     df = df.set_index('date')
     df = df.resample('D').ffill()  # 填充每日数据
+    df = df[df.index.weekday < 5]  # 再次过滤，确保仅交易日
     df['year'] = df.index.year
-    df['week'] = df.index.isocalendar().week
-    df['day'] = df.index.dayofweek
-    pivot_value = df.pivot_table(values='value', index=['year', 'week'], columns='day', aggfunc='last').fillna(0)
-    pivot_positions = df.pivot_table(values='positions', index=['year', 'week'], columns='day', aggfunc='last').fillna('No Position')
+    df['month'] = df.index.month
+    df['day_of_month'] = df.index.day
+    df['trading_day'] = df.index.map(lambda x: x.weekday() + 1)  # 1=周一, 5=周五
 
-    y_labels = [f"{year} Week {week}" for year, week in pivot_value.index]
+    # 按年分组创建子图
+    years = df['year'].unique()
+    num_years = len(years)
+    fig = make_subplots(rows=num_years, cols=1, subplot_titles=[f"Year {year}" for year in years], vertical_spacing=0.1)
 
-    fig = px.imshow(pivot_value.values, labels=dict(x="Weekday", y="Week", color="持仓价值"),
-                    x=['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
-                    y=y_labels,
-                    color_continuous_scale='YlOrRd')
+    for i, year in enumerate(years, 1):
+        year_df = df[df['year'] == year]
+        pivot_data = pd.pivot_table(year_df, values='value', index='month', columns='trading_day', aggfunc='last').fillna(0)
+        # 确保有5列（交易日1-5）
+        pivot_data = pivot_data.reindex(columns=range(1, 6), fill_value=0)
+
+        # 生成hovertext
+        hover_text = np.full((12, 5), 'No Data', dtype=object)  # 12个月, 5个交易日
+        for month in range(1, 13):
+            month_df = year_df[year_df['month'] == month]
+            for day in range(1, 6):
+                value = pivot_data.loc[month, day] if month in pivot_data.index and day in pivot_data.columns else 0
+                pos_idx = month_df.index[month_df['trading_day'] == day][0] if not month_df[month_df['trading_day'] == day].empty else None
+                pos = month_df.loc[pos_idx, 'positions'] if pos_idx else 'No Position'
+                i_month = month - 1  # 0-based index
+                j_day = day - 1     # 0-based index
+                if 0 <= i_month < 12 and 0 <= j_day < 5:
+                    hover_text[i_month, j_day] = f"Value: {value:.2f}<br>Position: {pos}" if value > 0 else "No Data"
+
+        # 添加热力图
+        fig.add_trace(
+            go.Heatmap(
+                z=pivot_data.values,
+                x=['Mon', 'Tue', 'Wed', 'Thu', 'Fri'],  # 交易日标签
+                y=[f"Month {m}" for m in range(1, 13)],  # 月份标签
+                colorscale='YlOrRd',
+                colorbar=dict(title="持仓价值", thickness=15, len=0.8 / num_years),
+                hoverongaps=False,
+                hovertext=hover_text,
+                showscale=(i == num_years)  # 仅最后一个子图显示colorbar
+            ),
+            row=i, col=1
+        )
+
+        fig.update_xaxes(title_text="交易日", row=i, col=1)
+        fig.update_yaxes(title_text="月", row=i, col=1, autorange="reversed")
 
     fig.update_layout(
-        title="投资组合日历视图 (悬停查看持仓)",
-        height=800,
-        coloraxis_colorbar=dict(
-            title="持仓价值",
-            thickness=15,
-            len=0.8
-        )
-    )
-
-    # 添加hover显示positions
-    fig.update_traces(
-        hovertemplate="<b>周: %{y}</b><br>天: %{x}<br>价值: %{z}<br><extra>%{customdata}</extra>",
-        customdata=pivot_positions.values
+        title_text="投资组合日历热力图 (按年分子图)",
+        height=LAYOUT_HEIGHT_PER_SUBPLOT * num_years,
+        width=1000,
+        showlegend=False
     )
 
     return fig
