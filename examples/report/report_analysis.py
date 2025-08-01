@@ -299,47 +299,48 @@ def combine_model_figures(model_figures):
     return fig_combined
 
 def create_portfolio_calendar(recorder):
-    '''创建投资组合日历热力图（按年分子图，x轴为交易日，y轴为月）'''
+    """创建投资组合日历热力图（按年分子图，x轴为交易日，y轴为月）"""
     try:
         positions = recorder.load_object("portfolio_analysis/positions_normal_1day.pkl")
     except Exception as e:
         print(f"⚠️ 加载持仓数据失败: {e}")
         return None
 
-    # 提取数据并为每个日期获取持仓详情
+    # 假设positions是dict: date -> dict of instrument -> amount
+    dates = sorted(positions.keys())
     calendar_data = []
-    all_dates = sorted(positions.keys())
-    all_instruments = set()
-    for date in all_dates:
+    prev_pos = None
+    for idx, date in enumerate(dates):
         pos = positions[date]
-        if hasattr(pos, 'position') and isinstance(pos.position, dict):
-            all_instruments.update(pos.position.keys())
-
-    # 批量获取所有价格
-    #price_df = D.features(list(all_instruments), ['$close'], start_time=min(all_dates), end_time=max(all_dates), freq='day') if all_instruments else pd.DataFrame()
-
-    for date in all_dates:
-        pos = positions[date]
-        total_value = pos.position.get('now_account_value', 0)
-        if hasattr(pos, 'position') and isinstance(pos.position, dict):
-            instruments = sorted(pos.position.keys())
-            formatted = []
-            # if not price_df.empty and date in price_df.index.get_level_values(1):
-            #     date_prices = price_df.loc[pd.IndexSlice[:, date], '$close']
-            # else:
-            #     date_prices = pd.Series()
-            for inst in instruments:
+        total_value = pos.calculate_value()  # Assuming this method exists; adjust if needed
+        turnover = 0.0
+        trades_info = []
+        if prev_pos is not None and hasattr(pos, 'position') and hasattr(prev_pos, 'position'):
+            current_pos = pos.position
+            prev_pos_dict = prev_pos.position
+            all_instr = set(current_pos.keys()) .union(prev_pos_dict.keys())
+            buy_value = sell_value = 0
+            for inst in all_instr:
                 if inst == 'cash' or inst == 'now_account_value':
                     continue
-                amount = pos.position[inst]['amount']
-                price = pos.position[inst]['price']
-                formatted.append(f"{inst}: price: {price:.2f} shares: {amount:.0f}")
-            pos_str = '<br>'.join(formatted) if formatted else 'No Position'
-        else:
-            pos_str = 'No Position'
-        calendar_data.append({'date': date, 'value': total_value, 'positions': pos_str})
+                curr_amount = current_pos.get(inst, {}).get('amount', 0)
+                prev_amount = prev_pos_dict.get(inst, {}).get('amount', 0)
+                prev_price = prev_pos_dict.get(inst, {}).get('price', 0)
+                delta = curr_amount - prev_amount
+                if delta > 0:
+                    buy_value += delta * current_pos[inst]['price']
+                    trades_info.append(f"Bought {inst}: {delta:.0f} shares")
+                elif delta < 0:
+                    sell_value += -delta * prev_price
+                    trades_info.append(f"Sold {inst}: {-delta:.0f} shares")
+            turnover = (buy_value + sell_value) / total_value if total_value > 0 else 0
+        trades_str = '<br>'.join(trades_info) if trades_info else 'No Trades'
+        calendar_data.append({'date': date, 'turnover': turnover, 'trades': trades_str})
+        prev_pos = pos
 
     df = pd.DataFrame(calendar_data)
+
+    # 转换为日历格式，限制为交易日（周一至周五）
     df['date'] = pd.to_datetime(df['date'])
     df = df[df['date'].dt.weekday < 5]  # 仅保留周一至周五
     df = df.set_index('date')
@@ -352,38 +353,37 @@ def create_portfolio_calendar(recorder):
     # 按年分组创建子图
     years = df['year'].unique()
     num_years = len(years)
-    fig = make_subplots(rows=num_years, cols=1, subplot_titles=[f"Year {year}" for year in years], vertical_spacing=0.05, shared_xaxes=True)
+    fig = make_subplots(rows=num_years, cols=1, subplot_titles=[f"Year {year}" for year in years], vertical_spacing=0.1, shared_xaxes=True)
 
     for i, year in enumerate(years, 1):
         year_df = df[df['year'] == year]
-        pivot_data = pd.pivot_table(year_df, values='value', index='month', columns='trading_day', aggfunc='last').fillna(0)
+        pivot_data = pd.pivot_table(year_df, values='turnover', index='month', columns='trading_day', aggfunc='last').fillna(0)
         # 确保有5列（交易日1-5）
         pivot_data = pivot_data.reindex(columns=range(1, 6), fill_value=0)
 
         # 生成hovertext
-        hover_text = np.full((12, 5), 'No Data', dtype=object)  # 12个月, 5个交易日
+        hover_text = np.full((12, 5), 'No Trades', dtype=object)  # 12个月, 5个交易日
         for month in range(1, 13):
             month_df = year_df[year_df['month'] == month]
             for day in range(1, 6):
-                value = pivot_data.loc[month, day] if month in pivot_data.index and day in pivot_data.columns else 0
-                pos_idx = month_df.index[month_df['trading_day'] == day][-1] if not month_df[month_df['trading_day'] == day].empty else None  # Use last instead of first for consistency with 'last'
-                pos = month_df.loc[pos_idx, 'positions'] if pos_idx is not None else 'No Position'
+                turnover = pivot_data.loc[month, day] if month in pivot_data.index and day in pivot_data.columns else 0
+                pos_idx = month_df.index[month_df['trading_day'] == day][0] if not month_df[month_df['trading_day'] == day].empty else None
+                trades = month_df.loc[pos_idx, 'trades'] if pos_idx else 'No Trades'
                 i_month = month - 1  # 0-based index
                 j_day = day - 1     # 0-based index
                 if 0 <= i_month < 12 and 0 <= j_day < 5:
-                    hover_text[i_month, j_day] = f"Value: {value:.2f}<br>{pos}" if value > 0 else "No Data"
+                    hover_text[i_month, j_day] = f"Turnover: {turnover:.2%}<br>{trades}" if turnover > 0 else "No Trades"
 
         # 添加热力图
         fig.add_trace(
             go.Heatmap(
-                z=pivot_data.values,
+                z=pivot_data.values * 100,  # 转为百分比显示
                 x=['Mon', 'Tue', 'Wed', 'Thu', 'Fri'],  # 交易日标签
                 y=[calendar.month_abbr[m] for m in range(1, 13)],  # 月份缩写，如Jan, Feb
                 colorscale='YlOrRd',
-                colorbar=dict(title="持仓价值", thickness=15, len=0.8 / num_years, yanchor="middle", y=1 - (i - 0.5) / num_years),
+                colorbar=dict(title="换手率 (%)", thickness=15, len=0.8 / num_years, yanchor="middle", y=1 - (i - 0.5) / num_years),
                 hoverongaps=False,
                 hovertext=hover_text,
-                hoverinfo='text',
                 showscale=True
             ),
             row=i, col=1
@@ -394,7 +394,7 @@ def create_portfolio_calendar(recorder):
 
     fig.update_layout(
         title_text="投资组合日历热力图 (按年分子图)",
-        height=max(400, LAYOUT_HEIGHT_PER_SUBPLOT * num_years),
+        height=max(600, LAYOUT_HEIGHT_PER_SUBPLOT * num_years),
         width=1200,  # 增加宽度以改善比例
         showlegend=False,
         plot_bgcolor='rgba(240,240,240,0.8)',  # 轻微背景色提升可读性
