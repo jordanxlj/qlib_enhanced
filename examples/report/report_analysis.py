@@ -364,7 +364,7 @@ def create_portfolio_calendar(recorder):
         print("⚠️ 无有效年份数据")
         return None
 
-    fig = make_subplots(rows=num_years, cols=1, subplot_titles=[f"Year {year}" for year in years], vertical_spacing=0.05, shared_xaxes=True)
+    fig = make_subplots(rows=num_years, cols=1, subplot_titles=[f"Year {year}" for year in years], vertical_spacing=0.05, shared_xaxes=False)
 
     max_turnover = df['turnover'].max() * 100 if not df['turnover'].empty else 25
 
@@ -400,7 +400,7 @@ def create_portfolio_calendar(recorder):
                 x=list(range(1, 32)),
                 y=[calendar.month_abbr[m] for m in range(1, 13)],
                 colorscale='YlOrRd',
-                colorbar=dict(title="换手率 (%)", thickness=15, len=0.8 / num_years, yanchor="middle", y=1 - (i - 0.5) / num_years),
+                colorbar=dict(title="换手率 (%)", thickness=15, len=1/num_years, yanchor="middle", y=1 - (i - 0.5) / num_years),
                 hoverongaps=False,
                 hovertext=hover_text,
                 hovertemplate="%{hovertext}<extra></extra>",
@@ -415,7 +415,7 @@ def create_portfolio_calendar(recorder):
             row=i, col=1
         )
 
-        fig.update_xaxes(title_text="日期 (日)", row=i, col=1, tickfont=dict(size=12), dtick=1, tickvals=list(range(1, 32)), ticktext=[str(d) for d in range(1, 32)])
+        fig.update_xaxes(title_text="日期 (日)", row=i, col=1, tickfont=dict(size=9), dtick=1, tickvals=list(range(1, 32)), ticktext=[str(d) for d in range(1, 32)], tickangle=60, showticklabels=True, ticks="outside")
         fig.update_yaxes(title_text="月份", row=i, col=1, autorange="reversed", tickfont=dict(size=12), gridcolor='lightgray')
 
     fig.update_layout(
