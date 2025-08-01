@@ -312,6 +312,7 @@ def create_portfolio_calendar(recorder):
     prev_pos = None
     for idx, date in enumerate(dates):
         pos = positions[date]
+        cash = pos.get_cash()
         total_value = pos.calculate_value() if hasattr(pos, 'calculate_value') else 1  # 防止除零
         turnover = 0.0
         trades_info = []
@@ -336,7 +337,8 @@ def create_portfolio_calendar(recorder):
                     trades_info.append(f"Sold {inst}: {-delta:.0f} shares")
             turnover = (buy_value + sell_value) / total_value if total_value > 0 else 0
         trades_str = '<br>'.join(trades_info) if trades_info else 'No Trades'
-        calendar_data.append({'date': date, 'turnover': turnover, 'trades': trades_str})
+        position = 100 * (total_value - cash) / total_value if total_value > 0 else 0
+        calendar_data.append({'date': date, 'turnover': turnover, 'position': position, 'trades': trades_str})
         prev_pos = pos
 
     if not calendar_data:
@@ -372,10 +374,12 @@ def create_portfolio_calendar(recorder):
         year_df = df[df['year'] == year]
         pivot_data = pd.pivot_table(year_df, values='turnover', index='month', columns='day_of_month', aggfunc='first')  # first 因为ffill
         pivot_hover = pd.pivot_table(year_df, values='trades', index='month', columns='day_of_month', aggfunc='first')
+        pivot_value = pd.pivot_table(year_df, values='position', index='month', columns='day_of_month', aggfunc='first')
 
         # Reindex to ensure all 12 months and 31 days
         pivot_data = pivot_data.reindex(index=range(1,13), columns=range(1,32), fill_value=0)
         pivot_hover = pivot_hover.reindex(index=range(1,13), columns=range(1,32), fill_value='No Data')
+        pivot_value = pivot_value.reindex(index=range(1,13), columns=range(1,32), fill_value=0)
 
         z_values = pivot_data.values * 100
 
@@ -390,32 +394,43 @@ def create_portfolio_calendar(recorder):
                 day = d + 1
                 value = z_values[m, d]
                 trades = pivot_hover.iloc[m, d]
+                total_value = pivot_value.iloc[m,d]
                 if value > 0:
-                    hover_text[m, d] = f"Date: {year}-{month:02d}-{day:02d}<br>Turnover: {value:.2f}%<br>{trades}"
+                    hover_text[m, d] = f"Date: {year}-{month:02d}-{day:02d}<br>Turnover: {value:.2f}%<br>Position: {total_value:,.2f}<br>{trades}"
 
         # 添加热力图
-        fig.add_trace(
-            go.Heatmap(
-                z=z_values,
-                x=list(range(1, 32)),
-                y=[calendar.month_abbr[m] for m in range(1, 13)],
-                colorscale='YlOrRd',
-                colorbar=dict(title="换手率 (%)", thickness=15, len=1/num_years, yanchor="middle", y=1 - (i - 0.5) / num_years),
-                hoverongaps=False,
-                hovertext=hover_text,
-                hovertemplate="%{hovertext}<extra></extra>",
-                text=text_values,
-                texttemplate="%{text}",
-                textfont=dict(size=8, color='black'),
-                showscale=True,
-                zmin=0,
-                zmax=max_turnover,
-                connectgaps=False
-            ),
-            row=i, col=1
+        heatmap_trace = go.Heatmap(
+            z=z_values,
+            x=list(range(1, 32)),
+            y=[calendar.month_abbr[m] for m in range(1, 13)],
+            colorscale='YlOrRd',
+            hoverongaps=False,
+            hovertext=hover_text,
+            hovertemplate="%{hovertext}<extra></extra>",
+            text=text_values,
+            texttemplate="%{text}",
+            textfont=dict(size=8, color='black'),
+            showscale=True,
+            zmin=0,
+            zmax=max_turnover,
+            connectgaps=False
+        )
+        fig.add_trace(heatmap_trace, row=i, col=1)
+
+        # Dynamically set colorbar height to match the subplot height
+        subplot_height = 600 / num_years  # Total height divided by number of years
+        colorbar_y = 1 - (i - 0.5) / num_years  # Center the colorbar vertically in the subplot
+        heatmap_trace.colorbar = dict(
+            title="换手率 (%)",
+            thickness=15,
+            len=subplot_height / 600,  # Normalize length to the total figure height
+            yanchor="middle",
+            y=colorbar_y,
+            x=1.02,
+            title_side="right"
         )
 
-        fig.update_xaxes(title_text="日期 (日)", row=i, col=1, tickfont=dict(size=9), dtick=1, tickvals=list(range(1, 32)), ticktext=[str(d) for d in range(1, 32)], tickangle=60, showticklabels=True, ticks="outside")
+        fig.update_xaxes(title_text="日期 (日)", row=i, col=1, tickfont=dict(size=9), dtick=1, tickvals=list(range(1, 32)), ticktext=[str(d) for d in range(1, 32)], tickangle=90, showticklabels=True, ticks="outside")
         fig.update_yaxes(title_text="月份", row=i, col=1, autorange="reversed", tickfont=dict(size=12), gridcolor='lightgray')
 
     fig.update_layout(
@@ -424,7 +439,7 @@ def create_portfolio_calendar(recorder):
         width=1200,  # 增加宽度以改善比例
         showlegend=False,
         plot_bgcolor='rgba(240,240,240,0.8)',  # 轻微背景色提升可读性
-        margin=dict(l=80, r=80, t=50, b=50),  # 调整边距
+        margin=dict(l=80, r=80, t=50, b=100),  # 调整边距
     )
 
     for i in range(1, num_years + 1):
