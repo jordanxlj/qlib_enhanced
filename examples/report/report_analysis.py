@@ -359,4 +359,78 @@ try:
 except Exception as e:
     print(f"⚠️ 投资组合分析失败: {e}")
 
-print("✅ 分析完成!")
+def create_portfolio_calendar(recorder):
+    """创建投资组合日历热力图"""
+    try:
+        positions = recorder.load_object("portfolio_analysis/positions_normal_1day.pkl")
+    except Exception as e:
+        print(f"⚠️ 加载持仓数据失败: {e}")
+        return None
+
+    # 假设positions是dict: date -> dict of instrument -> amount
+    calendar_data = []
+    for date, pos in positions.items():
+        total_value = sum(pos.values())  # 简单假设价值为数量总和
+        calendar_data.append({'date': date, 'value': total_value, 'positions': pos})
+
+    df = pd.DataFrame(calendar_data)
+
+    fig = px.calendar(df, x='date', y='value',
+                      color='value',
+                      labels={'value': '持仓价值'})
+
+    fig.update_layout(
+        title="投资组合日历视图 (点击日期查看持仓)",
+        height=600
+    )
+
+    # 添加点击交互 - 通过hover显示持仓详情
+    # 注意: Plotly Express不支持直接click，但hover可以显示
+    fig.update_traces(
+        hovertemplate="<b>日期: %{x}</b><br>总价值: %{y}<br><extra>点击查看详情</extra>"
+    )
+
+    return fig
+
+def create_trades_table(recorder):
+    """创建交易记录表格"""
+    try:
+        trades = recorder.load_object("trades.pkl")  # 假设是DataFrame
+    except Exception as e:
+        print(f"⚠️ 加载交易数据失败: {e}")
+        return None
+
+    # 假设trades有列: date, instrument, amount, price, direction
+    fig = go.Figure(data=[go.Table(
+        header=dict(values=list(trades.columns),
+                    fill_color='paleturquoise',
+                    align='left'),
+        cells=dict(values=[trades[col] for col in trades.columns],
+                   fill_color='lavender',
+                   align='left'))
+    ])
+
+    fig.update_layout(
+        title="交易记录表格",
+        height=600
+    )
+
+    return fig
+
+# 投资组合日历可视化
+print("📅 生成投资组合日历...")
+calendar_fig = create_portfolio_calendar(recorder)
+if calendar_fig:
+    calendar_fig.show()
+    pyo.plot(calendar_fig, filename=f'portfolio_calendar_{args.rec_id}.html', auto_open=False)
+    print(f"📁 持仓日历已保存: portfolio_calendar_{args.rec_id}.html")
+
+# 交易记录表格
+print("📋 生成交易记录表格...")
+trades_fig = create_trades_table(recorder)
+if trades_fig:
+    trades_fig.show()
+    pyo.plot(trades_fig, filename=f'trades_table_{args.rec_id}.html', auto_open=False)
+    print(f"📁 交易表格已保存: trades_table_{args.rec_id}.html")
+
+print("✅ 所有可视化完成!")
