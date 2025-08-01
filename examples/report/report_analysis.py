@@ -370,24 +370,43 @@ def create_portfolio_calendar(recorder):
     # 假设positions是dict: date -> dict of instrument -> amount
     calendar_data = []
     for date, pos in positions.items():
-        total_value = sum(pos.values())  # 简单假设价值为数量总和
-        calendar_data.append({'date': date, 'value': total_value, 'positions': pos})
+        total_value = pos.calculate_value()  # Assuming this method exists; adjust if needed
+        calendar_data.append({'date': date, 'value': total_value, 'positions': str(pos)})
 
     df = pd.DataFrame(calendar_data)
 
-    fig = px.calendar(df, x='date', y='value',
-                      color='value',
-                      labels={'value': '持仓价值'})
+    # 使用imshow创建日历热力图
+    # 先处理数据为周-日矩阵
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.set_index('date')
+    df = df.resample('D').ffill()  # 填充每日数据
+    df['year'] = df.index.year
+    df['week'] = df.index.isocalendar().week
+    df['day'] = df.index.dayofweek
+    pivot_value = df.pivot_table(values='value', index=['year', 'week'], columns='day', aggfunc='last').fillna(0)
+    pivot_positions = df.pivot_table(values='positions', index=['year', 'week'], columns='day', aggfunc='last').fillna('No Position')
+
+    y_labels = [f"{year} Week {week}" for year, week in pivot_value.index]
+
+    fig = px.imshow(pivot_value.values, labels=dict(x="Weekday", y="Week", color="持仓价值"),
+                    x=['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+                    y=y_labels,
+                    color_continuous_scale='YlOrRd')
 
     fig.update_layout(
-        title="投资组合日历视图 (点击日期查看持仓)",
-        height=600
+        title="投资组合日历视图 (悬停查看持仓)",
+        height=800,
+        coloraxis_colorbar=dict(
+            title="持仓价值",
+            thickness=15,
+            len=0.8
+        )
     )
 
-    # 添加点击交互 - 通过hover显示持仓详情
-    # 注意: Plotly Express不支持直接click，但hover可以显示
+    # 添加hover显示positions
     fig.update_traces(
-        hovertemplate="<b>日期: %{x}</b><br>总价值: %{y}<br><extra>点击查看详情</extra>"
+        hovertemplate="<b>周: %{y}</b><br>天: %{x}<br>价值: %{z}<br><extra>%{customdata}</extra>",
+        customdata=pivot_positions.values
     )
 
     return fig
@@ -401,6 +420,8 @@ def create_trades_table(recorder):
         return None
 
     # 假设trades有列: date, instrument, amount, price, direction
+    trades = trades.sort_values('date')  # 按日期排序
+
     fig = go.Figure(data=[go.Table(
         header=dict(values=list(trades.columns),
                     fill_color='paleturquoise',
@@ -411,7 +432,7 @@ def create_trades_table(recorder):
     ])
 
     fig.update_layout(
-        title="交易记录表格",
+        title="交易记录表格 (按日期排序)",
         height=600
     )
 
@@ -422,7 +443,7 @@ print("📅 生成投资组合日历...")
 calendar_fig = create_portfolio_calendar(recorder)
 if calendar_fig:
     calendar_fig.show()
-    pyo.plot(calendar_fig, filename=f'portfolio_calendar_{args.rec_id}.html', auto_open=False)
+    pio.write_html(calendar_fig, file=f'portfolio_calendar_{args.rec_id}.html')
     print(f"📁 持仓日历已保存: portfolio_calendar_{args.rec_id}.html")
 
 # 交易记录表格
@@ -430,7 +451,7 @@ print("📋 生成交易记录表格...")
 trades_fig = create_trades_table(recorder)
 if trades_fig:
     trades_fig.show()
-    pyo.plot(trades_fig, filename=f'trades_table_{args.rec_id}.html', auto_open=False)
+    pio.write_html(trades_fig, file=f'trades_table_{args.rec_id}.html')
     print(f"📁 交易表格已保存: trades_table_{args.rec_id}.html")
 
 print("✅ 所有可视化完成!")
