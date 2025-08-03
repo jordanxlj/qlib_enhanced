@@ -90,6 +90,12 @@ def add_turnover(fig, report_df, row, col, legend_group):
                                  line=dict(color=COLORS['turnover'], width=2), legend=legend_group, showlegend=True),
                       row=row, col=col)
 
+def add_position(fig, position_series, row, col, legend_group):
+    """添加总体仓位百分比曲线到子图"""
+    fig.add_trace(go.Scatter(x=position_series.index, y=position_series, mode='lines', name='总体仓位',
+                             line=dict(color='#8d64bd', width=2), legend=legend_group, showlegend=True),
+                  row=row, col=col)
+
 def add_performance_metrics(fig, report_df, row, col):
     """添加关键指标文本总结到子图"""
     metrics_lines = []
@@ -149,7 +155,7 @@ def add_performance_metrics(fig, report_df, row, col):
         yanchor="middle"
     )
 
-def create_position_analysis_plots(report_df):
+def create_position_analysis_plots(report_df, recorder):
     """使用 Plotly 创建投资组合分析图表（单列布局）"""
     if report_df is None or report_df.empty:
         print("⚠️ 投资组合报告数据为空")
@@ -157,13 +163,25 @@ def create_position_analysis_plots(report_df):
 
     print(f"📊 投资组合数据列: {report_df.columns.tolist()}")
 
+    # 加载positions数据以计算总体仓位
+    try:
+        positions = recorder.load_object("portfolio_analysis/positions_normal_1day.pkl")
+        position_series = pd.Series({date: 100 * (pos.calculate_value() - pos.get_cash()) / (pos.calculate_value() or 1) 
+                                     for date, pos in positions.items()})
+        position_series.index = pd.to_datetime(position_series.index)
+        position_series = position_series.reindex(report_df.index, method='nearest')  # 与report_df对齐
+    except Exception as e:
+        print(f"⚠️ 加载持仓数据失败: {e}")
+        position_series = None
+
     fig = make_subplots(
-        rows=5, cols=1,
+        rows=6, cols=1,
         subplot_titles=[
             '累积收益对比 (Cumulative Returns)',
             '每日收益分布 (Daily Returns Distribution)',
             '最大回撤 (Maximum Drawdown)',
             '换手率 (Turnover)',
+            '总体仓位百分比 (Position Percentage)',
             '收益指标总结 (Performance Metrics)'
         ],
         vertical_spacing=0.08
@@ -171,7 +189,7 @@ def create_position_analysis_plots(report_df):
 
     # 为每个subplot定义独立的legend
     legend_configs = {}
-    num_rows = 5
+    num_rows = 6
     for row in range(1, num_rows + 1):
         legend_name = f'legend{row}'
         y_pos = 1 - (row - 1) / num_rows - 0.5 / num_rows  # 居中于subplot
@@ -181,12 +199,14 @@ def create_position_analysis_plots(report_df):
     add_return_distribution(fig, report_df, row=2, col=1, legend_group='legend2')
     add_drawdown(fig, report_df, row=3, col=1, legend_group='legend3')
     add_turnover(fig, report_df, row=4, col=1, legend_group='legend4')
-    add_performance_metrics(fig, report_df, row=5, col=1)
+    if position_series is not None:
+        add_position(fig, position_series, row=5, col=1, legend_group='legend5')
+    add_performance_metrics(fig, report_df, row=6, col=1)
 
     fig.update_layout(
         title_text="📈 投资组合综合分析报告",
         title_x=0.5,
-        height=LAYOUT_HEIGHT_PER_SUBPLOT * 5,
+        height=LAYOUT_HEIGHT_PER_SUBPLOT * 6,
         showlegend=True,
         **legend_configs  # 添加所有legend配置
     )
@@ -200,8 +220,10 @@ def create_position_analysis_plots(report_df):
     fig.update_yaxes(title_text="回撤幅度", row=3, col=1)
     fig.update_xaxes(title_text="日期", row=4, col=1)
     fig.update_yaxes(title_text="换手率", row=4, col=1)
-    fig.update_xaxes(visible=False, row=5, col=1)
-    fig.update_yaxes(visible=False, row=5, col=1)
+    fig.update_xaxes(title_text="日期", row=5, col=1)
+    fig.update_yaxes(title_text="仓位百分比 (%)", row=5, col=1)
+    fig.update_xaxes(visible=False, row=6, col=1)
+    fig.update_yaxes(visible=False, row=6, col=1)
 
     return fig
 
