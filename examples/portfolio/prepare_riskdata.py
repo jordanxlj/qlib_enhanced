@@ -14,15 +14,13 @@ def prepare_data(riskdata_root="./riskdata", T=240, start_time="2022-01-01"):
     price_all = (
         D.features(D.instruments("all"), ["$close"], start_time=start_time).squeeze().unstack(level="instrument")
     )
-    import pdb; pdb.set_trace()
+
     # StructuredCovEstimator is a statistical risk model
     riskmodel = StructuredCovEstimator()
 
     for i in range(T - 1, len(price_all)):
         date = price_all.index[i]
         ref_date = price_all.index[i - T + 1]
-
-        print(date)
 
         codes = universe.loc[date].index
         price = price_all.loc[ref_date:date, codes]

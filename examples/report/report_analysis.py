@@ -13,7 +13,7 @@ import plotly.io as pio
 from scipy.stats import pearsonr, spearmanr
 from datetime import datetime
 import calendar  # For month names
-from qlib.data import D
+from qlib.data import D, FileInstrumentInfo
 
 # 常量定义：颜色方案和布局设置
 COLORS = {
@@ -298,8 +298,8 @@ def combine_model_figures(model_figures):
 
     return fig_combined
 
-def create_portfolio_calendar(recorder):
-    """创建投资组合日历热力图（按年分子图，x轴为每月日期，y轴为月份）"""
+def create_portfolio_calendar(recorder, instrument_info):
+    """创建投资组合日历热力图��按年分子图，x轴为每月日期，y轴为月份）"""
     try:
         positions = recorder.load_object("portfolio_analysis/positions_normal_1day.pkl")
     except Exception as e:
@@ -324,6 +324,7 @@ def create_portfolio_calendar(recorder):
             for inst in all_instr:
                 if inst in {'cash', 'now_account_value'}:
                     continue
+                name = instrument_info[inst]['name'] if instrument_info.get(inst) else inst
                 curr_amount = current_pos.get(inst, {}).get('amount', 0)
                 prev_amount = prev_pos_dict.get(inst, {}).get('amount', 0)
                 curr_price = current_pos.get(inst, {}).get('price', 0)
@@ -331,10 +332,10 @@ def create_portfolio_calendar(recorder):
                 delta = curr_amount - prev_amount
                 if delta > 0:
                     buy_value += delta * curr_price
-                    trades_info.append(f"Bought {inst}: {delta:.0f} shares")
+                    trades_info.append(f"Bought {name}: {delta:.0f} shares")
                 elif delta < 0:
                     sell_value += -delta * prev_price
-                    trades_info.append(f"Sold {inst}: {-delta:.0f} shares")
+                    trades_info.append(f"Sold {name}: {-delta:.0f} shares")
             turnover = (buy_value + sell_value) / total_value if total_value > 0 else 0
         trades_str = '<br>'.join(trades_info) if trades_info else 'No Trades'
         position = 100 * (total_value - cash) / total_value if total_value > 0 else 0
@@ -366,7 +367,7 @@ def create_portfolio_calendar(recorder):
         print("⚠️ 无有效年份数据")
         return None
 
-    fig = make_subplots(rows=num_years, cols=1, subplot_titles=[f"Year {year}" for year in years], vertical_spacing=0.05, shared_xaxes=False)
+    fig = make_subplots(rows=num_years, cols=1, subplot_titles=[f"Year {year}" for year in years], vertical_spacing=0.02, shared_xaxes=False)
 
     max_turnover = df['turnover'].max() * 100 if not df['turnover'].empty else 25
 
@@ -486,6 +487,7 @@ if __name__ == '__main__':
     parser.add_argument("--rec_id", type=str, required=True, help="Recorder ID")
     args = parser.parse_args()
 
+    instrument_info = FileInstrumentInfo(provider_uri='data')
     qlib.init(provider_uri='data', region=REG_CN)
 
     try:
@@ -551,7 +553,7 @@ if __name__ == '__main__':
 
     # 投资组合日历可视化
     print("📅 生成投资组合日历...")
-    calendar_fig = create_portfolio_calendar(recorder)
+    calendar_fig = create_portfolio_calendar(recorder, instrument_info)
     if calendar_fig:
         calendar_fig.show()
         pio.write_html(calendar_fig, file=f'portfolio_calendar_{args.rec_id}.html')
