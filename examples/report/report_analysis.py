@@ -155,6 +155,17 @@ def add_performance_metrics(fig, report_df, row, col):
         yanchor="middle"
     )
 
+def add_holding_period_histogram(fig, holding_periods, row, col, legend_group):
+    """添加每只股票持仓时间直方图到子图"""
+    if holding_periods:
+        max_period = max(holding_periods) if holding_periods else 30
+        fig.add_trace(go.Histogram(x=holding_periods, xbins=dict(start=0.5, end=max_period + 0.5, size=1),
+                                   name='持仓时间分布',
+                                   marker_color='#e377c2', opacity=0.7, legend=legend_group, showlegend=True),
+                      row=row, col=col)
+    else:
+        fig.add_annotation(text="无持仓时间数据", x=0.5, y=0.5, showarrow=False, font=dict(size=14), row=row, col=col)
+
 def create_position_analysis_plots(report_df, recorder):
     """使用 Plotly 创建投资组合分析图表（单列布局）"""
     if report_df is None or report_df.empty:
@@ -170,18 +181,46 @@ def create_position_analysis_plots(report_df, recorder):
                                      for date, pos in positions.items()})
         position_series.index = pd.to_datetime(position_series.index)
         position_series = position_series.reindex(report_df.index, method='nearest')  # 与report_df对齐
+
+        # 计算每只股票的持仓时间（连续持仓取最长，多次持仓分别计算）
+        dates = sorted(positions.keys())
+        stock_holdings = {}
+        for date in dates:
+            pos = positions[date]
+            if hasattr(pos, 'position'):
+                for stock, info in pos.position.items():
+                    if stock in {'cash', 'now_account_value'} or info.get('amount', 0) <= 0:
+                        continue
+                    if stock not in stock_holdings:
+                        stock_holdings[stock] = []
+                    stock_holdings[stock].append(date)
+
+        holding_periods = []
+        for stock, hold_dates in stock_holdings.items():
+            hold_dates = sorted(set(hold_dates))  # 去除重复
+            if not hold_dates:
+                continue
+            periods = []
+            start = hold_dates[0]
+            for i in range(1, len(hold_dates)):
+                if (hold_dates[i] - hold_dates[i-1]).days > 1:  # 非连续
+                    periods.append((hold_dates[i-1] - start).days + 1)
+                    start = hold_dates[i]
+            periods.append((hold_dates[-1] - start).days + 1)
+            if periods:
+                holding_periods.extend(periods)  # 分别添加每个持仓期
     except Exception as e:
         print(f"⚠️ 加载持仓数据失败: {e}")
-        position_series = None
 
     fig = make_subplots(
-        rows=6, cols=1,
+        rows=7, cols=1,
         subplot_titles=[
             '累积收益对比 (Cumulative Returns)',
             '每日收益分布 (Daily Returns Distribution)',
             '最大回撤 (Maximum Drawdown)',
             '换手率 (Turnover)',
             '总体仓位百分比 (Position Percentage)',
+            '持仓时间分布 (Holding Period Distribution)',
             '收益指标总结 (Performance Metrics)'
         ],
         vertical_spacing=0.08
@@ -189,7 +228,7 @@ def create_position_analysis_plots(report_df, recorder):
 
     # 为每个subplot定义独立的legend
     legend_configs = {}
-    num_rows = 6
+    num_rows = 7
     for row in range(1, num_rows + 1):
         legend_name = f'legend{row}'
         y_pos = 1 - (row - 1) / num_rows - 0.5 / num_rows  # 居中于subplot
@@ -201,12 +240,13 @@ def create_position_analysis_plots(report_df, recorder):
     add_turnover(fig, report_df, row=4, col=1, legend_group='legend4')
     if position_series is not None:
         add_position(fig, position_series, row=5, col=1, legend_group='legend5')
-    add_performance_metrics(fig, report_df, row=6, col=1)
+    add_holding_period_histogram(fig, holding_periods, row=6, col=1, legend_group='legend6')
+    add_performance_metrics(fig, report_df, row=7, col=1)
 
     fig.update_layout(
         title_text="📈 投资组合综合分析报告",
         title_x=0.5,
-        height=LAYOUT_HEIGHT_PER_SUBPLOT * 6,
+        height=LAYOUT_HEIGHT_PER_SUBPLOT * 7,
         showlegend=True,
         **legend_configs  # 添加所有legend配置
     )
@@ -222,8 +262,10 @@ def create_position_analysis_plots(report_df, recorder):
     fig.update_yaxes(title_text="换手率", row=4, col=1)
     fig.update_xaxes(title_text="日期", row=5, col=1)
     fig.update_yaxes(title_text="仓位百分比 (%)", row=5, col=1)
-    fig.update_xaxes(visible=False, row=6, col=1)
-    fig.update_yaxes(visible=False, row=6, col=1)
+    fig.update_xaxes(title_text="持仓天数", row=6, col=1)
+    fig.update_yaxes(title_text="频次", row=6, col=1)
+    fig.update_xaxes(visible=False, row=7, col=1)
+    fig.update_yaxes(visible=False, row=7, col=1)
 
     return fig
 
@@ -565,7 +607,7 @@ if __name__ == '__main__':
     print("📊 正在生成投资组合分析图表...")
     try:
         report_df = recorder.load_object("portfolio_analysis/report_normal_1day.pkl")
-        position_fig = create_position_analysis_plots(report_df)
+        position_fig = create_position_analysis_plots(report_df, recorder)
         if position_fig:
             position_fig.show()
             pio.write_html(position_fig, file=f'position_analysis_{args.rec_id}.html')
