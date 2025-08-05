@@ -9,10 +9,10 @@ from qlib.utils.resam import resam_ts_data
 def calculate_returns(prices: pd.DataFrame) -> pd.DataFrame:
     """
     Calculate log returns from prices DataFrame.
-
+    
     Parameters:
     - prices: pd.DataFrame with datetime index and instruments as columns.
-
+    
     Returns:
     - pd.DataFrame of log returns.
     """
@@ -21,11 +21,11 @@ def calculate_returns(prices: pd.DataFrame) -> pd.DataFrame:
 def resample_returns(returns: pd.DataFrame, frequency: str) -> pd.DataFrame:
     """
     Resample returns to the specified frequency.
-
+    
     Parameters:
     - returns: pd.DataFrame of returns.
     - frequency: str, 'day', 'week', or 'month'.
-
+    
     Returns:
     - Resampled returns DataFrame.
     """
@@ -41,11 +41,11 @@ def resample_returns(returns: pd.DataFrame, frequency: str) -> pd.DataFrame:
 def historical_volatility(returns: pd.DataFrame, window: int = 20) -> pd.DataFrame:
     """
     Calculate rolling historical volatility (std dev of returns).
-
+    
     Parameters:
     - returns: pd.DataFrame of returns.
     - window: int, rolling window size.
-
+    
     Returns:
     - pd.DataFrame of volatility.
     """
@@ -157,7 +157,7 @@ def portfolio_volatility(weights: pd.DataFrame, cov_df: pd.DataFrame) -> pd.Seri
         instruments = weights.columns
         try:
             # Try to get covariance data for time t
-            cov_t = cov_df.xs(t, level=0)
+            cov_t = cov_df.xs(t, level='datetime')
             # Unstack to get matrix form
             cov_matrix = cov_t['covariance'].unstack().reindex(index=instruments, columns=instruments, fill_value=0)
         except KeyError:

@@ -20,6 +20,8 @@ from qlib.log import get_module_logger
 from qlib.utils import get_pre_trading_date, load_dataset
 from qlib.contrib.strategy.order_generator import OrderGenerator, OrderGenWOInteract
 from qlib.contrib.strategy.optimizer import EnhancedIndexingOptimizer
+from qlib.contrib.strategy.historic_portfolio_volatility import portfolio_volatility, get_annualization_factor
+
 
 
 class BaseSignalStrategy(BaseStrategy, ABC):
@@ -193,6 +195,7 @@ class TopkDropoutStrategy(BaseSignalStrategy):
         # load score
         cash = current_temp.get_cash()
         current_stock_list = current_temp.get_stock_list()
+
         # last position (sorted by score)
         last = pred_score.reindex(current_stock_list).sort_values(ascending=False).index
         # The new stocks today want to buy **at most**
@@ -236,6 +239,7 @@ class TopkDropoutStrategy(BaseSignalStrategy):
                 end_time=trade_end_time,
                 direction=None if self.forbid_all_trade_at_limit else OrderDir.SELL,
             ):
+                print(f"stock_id: {code} is not tradable, skip it!")
                 continue
             if code in sell:
                 # check hold limit
@@ -277,6 +281,7 @@ class TopkDropoutStrategy(BaseSignalStrategy):
                 end_time=trade_end_time,
                 direction=None if self.forbid_all_trade_at_limit else OrderDir.BUY,
             ):
+                print(f"stock_id: {code} is not tradable, skip it!")
                 continue
             # buy order
             buy_price = self.trade_exchange.get_deal_price(
@@ -523,3 +528,241 @@ class EnhancedIndexingStrategy(WeightStrategyBase):
             self.logger.info("total holding weight: {:.6f}".format(weight.sum()))
 
         return target_weight_position
+
+
+class VolTopkDropoutStrategy(WeightStrategyBase):
+    def __init__(
+        self,
+        *,
+        topk,
+        n_drop,
+        method_sell="bottom",
+        method_buy="top",
+        hold_thresh=1,
+        only_tradable=False,
+        forbid_all_trade_at_limit=True,
+        vol_window=20,
+        vol_method="ma",
+        vol_half_life=11,
+        frequency="day",
+        target_volatility=0.1,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.topk = topk
+        self.n_drop = n_drop
+        self.method_sell = method_sell
+        self.method_buy = method_buy
+        self.hold_thresh = hold_thresh
+        self.only_tradable = only_tradable
+        self.forbid_all_trade_at_limit = forbid_all_trade_at_limit
+        self.vol_window = vol_window
+        self.vol_method = vol_method
+        self.vol_half_life = vol_half_life
+        self.frequency = frequency
+        self.target_volatility = target_volatility
+        self.vol_metrics = None
+
+    def _compute_portfolio_volatility(self):
+        """Compute portfolio volatility metrics using historic_portfolio_volatility module."""
+        from qlib.contrib.strategy.historic_portfolio_volatility import compute_portfolio_metrics
+        from qlib.data import D
+
+        trade_len = self.trade_calendar.get_trade_len()
+        signal_start_time, _ = self.trade_calendar.get_step_time(trade_step=0, shift=1)
+        _, signal_end_time = self.trade_calendar.get_step_time(trade_step=trade_len - 1, shift=1)
+
+        # Get all instruments from the universe
+        instruments = D.instruments("all")
+
+        # Compute portfolio metrics
+        self.vol_metrics = compute_portfolio_metrics(
+            instruments=instruments,
+            start_time=signal_start_time,
+            end_time=signal_end_time,
+            frequency=self.frequency,
+            vol_window=self.vol_window,
+            method=self.vol_method,
+            half_life=self.vol_half_life,
+            back_fill=True,
+        )
+
+    def reset_level_infra(self, level_infra):
+        super().reset_level_infra(level_infra)
+        if self.vol_window > 0:
+            self._compute_portfolio_volatility()
+
+    def generate_trade_decision(self, execute_result=None):
+        trade_step = self.trade_calendar.get_trade_step()
+        trade_start_time, trade_end_time = self.trade_calendar.get_step_time(trade_step)
+        pred_start_time, pred_end_time = self.trade_calendar.get_step_time(trade_step, shift=1)
+        pred_score = self.signal.get_signal(start_time=pred_start_time, end_time=pred_end_time)
+        if pred_score is None:
+            return TradeDecisionWO([], self)
+        current_temp = copy.deepcopy(self.trade_position)
+        assert isinstance(current_temp, Position)
+
+        target_weight_position = self.generate_target_weight_position(
+            score=pred_score, current=current_temp, trade_start_time=trade_start_time, trade_end_time=trade_end_time
+        )
+
+        risk_degree = self.get_risk_degree(trade_step)
+
+        if (
+            self.vol_window > 0
+            and self.vol_metrics is not None
+            and target_weight_position
+            and self.target_volatility is not None
+            and self.target_volatility > 0
+        ):
+            weights_df = pd.DataFrame([target_weight_position])
+
+            available_dates = self.vol_metrics["covariance"].index.get_level_values(0).unique()
+            closest_date = available_dates.asof(trade_start_time)
+            if pd.isna(closest_date):
+                closest_date = available_dates[0]
+
+            if closest_date:
+                weights_df.index = [closest_date]
+                port_vol_series = portfolio_volatility(weights_df, self.vol_metrics["covariance"])
+
+                if not port_vol_series.empty and port_vol_series.iloc[0] > 0:
+                    ann_factor = get_annualization_factor(self.frequency)
+                    annualized_vol = port_vol_series.iloc[0] * ann_factor
+
+                    if annualized_vol > 1e-6:
+                        adjustment = self.target_volatility / annualized_vol
+                        risk_degree *= adjustment
+
+        order_list = self.order_generator.generate_order_list_from_target_weight_position(
+            current=current_temp,
+            trade_exchange=self.trade_exchange,
+            risk_degree=risk_degree,
+            target_weight_position=target_weight_position,
+            pred_start_time=pred_start_time,
+            pred_end_time=pred_end_time,
+            trade_start_time=trade_start_time,
+            trade_end_time=trade_end_time,
+        )
+        return TradeDecisionWO(order_list, self)
+
+    def generate_target_weight_position(self, score, current, trade_start_time, trade_end_time):
+        pred_score = score
+        if isinstance(pred_score, pd.DataFrame):
+            pred_score = pred_score.iloc[:, 0]
+        if pred_score is None:
+            return {}
+
+        if self.only_tradable:
+
+            def get_first_n(li, n, reverse=False):
+                cur_n = 0
+                res = []
+                for si in reversed(li) if reverse else li:
+                    if self.trade_exchange.is_stock_tradable(
+                        stock_id=si, start_time=trade_start_time, end_time=trade_end_time
+                    ):
+                        res.append(si)
+                        cur_n += 1
+                        if cur_n >= n:
+                            break
+                return res[::-1] if reverse else res
+
+            def get_last_n(li, n):
+                return get_first_n(li, n, reverse=True)
+
+            def filter_stock(li):
+                return [
+                    si
+                    for si in li
+                    if self.trade_exchange.is_stock_tradable(
+                        stock_id=si, start_time=trade_start_time, end_time=trade_end_time
+                    )
+                ]
+
+        else:
+
+            def get_first_n(li, n):
+                return list(li)[:n]
+
+            def get_last_n(li, n):
+                return list(li)[-n:]
+
+            def filter_stock(li):
+                return li
+
+        current_temp: Position = copy.deepcopy(current)
+        current_stock_list = current_temp.get_stock_list()
+
+        last = pred_score.reindex(current_stock_list).sort_values(ascending=False).index
+        if self.method_buy == "top":
+            today = get_first_n(
+                pred_score[~pred_score.index.isin(last)].sort_values(ascending=False).index,
+                self.n_drop + self.topk - len(last),
+            )
+        elif self.method_buy == "random":
+            topk_candi = get_first_n(pred_score.sort_values(ascending=False).index, self.topk)
+            candi = list(filter(lambda x: x not in last, topk_candi))
+            n = self.n_drop + self.topk - len(last)
+            try:
+                today = np.random.choice(candi, n, replace=False)
+            except ValueError:
+                today = candi
+        else:
+            raise NotImplementedError(f"This type of input is not supported")
+        comb = pred_score.reindex(last.union(pd.Index(today))).sort_values(ascending=False).index
+
+        if self.method_sell == "bottom":
+            sell = last[last.isin(get_last_n(comb, self.n_drop))]
+        elif self.method_sell == "random":
+            candi = filter_stock(last)
+            try:
+                sell = pd.Index(np.random.choice(candi, self.n_drop, replace=False) if len(last) else [])
+            except ValueError:  # No enough candidates
+                sell = candi
+        else:
+            raise NotImplementedError(f"This type of input is not supported")
+
+        buy = today[: len(sell) + self.topk - len(last)]
+        target_codes = list(set(last).difference(sell).union(buy))
+
+        if self.vol_window <= 0 or self.vol_metrics is None:
+            weight = 1.0 / len(target_codes) if target_codes else 0
+            return {code: weight for code in target_codes}
+        else:
+            # Use computed volatility metrics for inverse volatility weighting
+            vol = {}
+            volatility_df = self.vol_metrics["volatility"]
+
+            # Find the closest available date for volatility data
+            available_dates = volatility_df.index
+            if trade_start_time not in available_dates:
+                # Find the closest previous date
+                before_dates = available_dates[available_dates <= trade_start_time]
+                if len(before_dates) > 0:
+                    closest_date = before_dates[-1]
+                else:
+                    closest_date = available_dates[0]
+            else:
+                closest_date = trade_start_time
+
+            for code in target_codes:
+                if code in volatility_df.columns:
+                    v = volatility_df.loc[closest_date, code]
+                    if not pd.isna(v) and v > 0:
+                        vol[code] = v
+
+            if not vol:
+                weight = 1.0 / len(target_codes) if target_codes else 0
+                return {code: weight for code in target_codes}
+
+            # For stocks without volatility data, use maximum observed volatility
+            max_vol = max(vol.values()) if vol else 1.0
+            for code in target_codes:
+                if code not in vol:
+                    vol[code] = max_vol
+
+            # Inverse volatility weighting
+            inv_vol = {code: 1 / v for code, v in vol.items()}
+            total_inv = sum(inv_vol.values())
+            return {code: iv / total_inv for code, iv in inv_vol.items()}
