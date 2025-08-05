@@ -155,7 +155,15 @@ def portfolio_volatility(weights: pd.DataFrame, cov_df: pd.DataFrame) -> pd.Seri
     for t in weights.index:
         w = weights.loc[t].fillna(0).values  # Handle missing weights as 0
         instruments = weights.columns
-        cov_matrix = cov_df.xs(t).unstack().reindex(index=instruments, columns=instruments, fill_value=0)
+        try:
+            # Try to get covariance data for time t
+            cov_t = cov_df.xs(t, level=0)
+            # Unstack to get matrix form
+            cov_matrix = cov_t['covariance'].unstack().reindex(index=instruments, columns=instruments, fill_value=0)
+        except KeyError:
+            # If no data for this time, create zero matrix
+            cov_matrix = pd.DataFrame(0.0, index=instruments, columns=instruments)
+        
         vol_t = np.sqrt(w.T @ cov_matrix.values @ w)
         vol.append(vol_t)
     return pd.Series(vol, index=weights.index)
@@ -188,7 +196,7 @@ def compute_portfolio_metrics(
     - dict with 'volatility' (pd.DataFrame), 'covariance' (pd.DataFrame), and optionally 'portfolio_vol' (pd.Series).
     """
     prices = D.features(instruments, ['$close'], start_time=start_time, end_time=end_time, freq=frequency)
-    prices = prices['$close'].unstack('instrument')
+    prices = prices['$close'].unstack(level=1).astype(float)
     
     returns = calculate_returns(prices)
     resampled_returns = resample_returns(returns, frequency)

@@ -14,15 +14,19 @@ from qlib.contrib.strategy.historic_portfolio_volatility import (
     calculate_returns,
     resample_returns,
 )
+from unittest.mock import patch
 
 @pytest.fixture
 def sample_returns():
     dates = pd.date_range('2023-01-01', periods=10)
-    data = {
-        'A': np.random.randn(10).cumsum(),
-        'B': np.random.randn(10).cumsum(),
+    log_returns = {
+        'A': np.random.randn(10),
+        'B': np.random.randn(10),
     }
-    prices = pd.DataFrame(data, index=dates)
+    prices = pd.DataFrame({
+        'A': np.exp(np.cumsum(log_returns['A'])),
+        'B': np.exp(np.cumsum(log_returns['B'])),
+    }, index=dates)
     returns = calculate_returns(prices)
     return returns
 
@@ -46,7 +50,7 @@ def test_weighted_covariance():
     y = pd.Series([4, 5, 6])
     weights = np.array([0.2, 0.3, 0.5])
     cov = weighted_covariance(x, y, weights)
-    assert cov == pytest.approx(1.0)  # Manual calc: weighted cov = 1.0
+    assert cov == pytest.approx(0.61)  # Corrected: weighted cov = 0.61
 
 def test_weighted_covariance_mismatch_length():
     with pytest.raises(ValueError):
@@ -77,26 +81,44 @@ def test_portfolio_volatility():
     weights = pd.DataFrame({'A': [0.5, 0.5, 0.5], 'B': [0.5, 0.5, 0.5]}, index=dates)
     cov_data = []
     for t in dates:
-        cov_matrix = pd.DataFrame({'A': [1, 0.5], 'B': [0.5, 1]}, index=['A', 'B'])
-        cov_data.append(cov_matrix.stack().to_frame('covariance').set_index(pd.Index([t]*4, name='datetime'), append=True).swaplevel(0,1))
+        df = pd.DataFrame({
+            'instrument1': ['A', 'A', 'B', 'B'],
+            'instrument2': ['A', 'B', 'A', 'B'],
+            'covariance': [1.0, 0.5, 0.5, 1.0],
+        })
+        df['datetime'] = t
+        cov_data.append(df.set_index(['datetime', 'instrument1', 'instrument2']))
     cov_df = pd.concat(cov_data)
-    cov_df.index = pd.MultiIndex.from_tuples(cov_df.index)
-
+    cov_df = cov_df.sort_index()
+    
     vol = portfolio_volatility(weights, cov_df)
     expected_vol = np.sqrt(0.5**2 * 1 + 0.5**2 * 1 + 2*0.5*0.5*0.5)  # = sqrt(0.75)
     np.testing.assert_array_almost_equal(vol, np.full(3, np.sqrt(0.75)))
 
-def test_compute_portfolio_metrics(sample_returns):
+@patch('qlib.contrib.strategy.historic_portfolio_volatility.D')
+def test_compute_portfolio_metrics(mock_D, sample_returns):
+    dates = sample_returns.index
     instruments = ['A', 'B']
-    start_time = sample_returns.index[0]
-    end_time = sample_returns.index[-1]
-    metrics = compute_portfolio_metrics(instruments, start_time, end_time, frequency='day', vol_window=5, method='ma')
+    mock_data = pd.DataFrame(
+        index=pd.MultiIndex.from_product([dates, instruments], names=['datetime', 'instrument']),
+        columns=['$close'],
+        dtype=float
+    )
+    mock_data.loc[(slice(None), 'A'), '$close'] = np.random.uniform(1, 100, len(dates))  # Positive prices
+    mock_data.loc[(slice(None), 'B'), '$close'] = np.random.uniform(1, 100, len(dates))
+    mock_data = mock_data.sort_index()
+    mock_D.features.return_value = mock_data
+    
+    instruments_list = instruments
+    start_time = dates[0]
+    end_time = dates[-1]
+    metrics = compute_portfolio_metrics(instruments_list, start_time, end_time, frequency='day', vol_window=5, method='ma')
     assert 'volatility' in metrics
     assert 'covariance' in metrics
     assert metrics['volatility'].shape == (10, 2)
-
-    weights = pd.DataFrame(np.full((10, 2), 0.5), index=sample_returns.index, columns=instruments)
-    metrics_with_port = compute_portfolio_metrics(instruments, start_time, end_time, frequency='day', vol_window=5, weights=weights)
+    
+    weights = pd.DataFrame(np.full((10, 2), 0.5), index=dates, columns=instruments)
+    metrics_with_port = compute_portfolio_metrics(instruments_list, start_time, end_time, frequency='day', vol_window=5, weights=weights, method='ma')
     assert 'portfolio_vol' in metrics_with_port
     assert len(metrics_with_port['portfolio_vol']) == 10
 
