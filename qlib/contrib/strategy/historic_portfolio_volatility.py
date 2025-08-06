@@ -119,9 +119,26 @@ def historical_covariance(returns: pd.DataFrame, window: int = 20, method: str =
         else:
             weights = generate_weights(n_win, method, half_life)
             cov_matrix = pd.DataFrame(index=instruments, columns=instruments)
-            for i in instruments:
-                for j in instruments:
-                    cov_matrix.loc[i, j] = weighted_covariance(ret_window[i], ret_window[j], weights)
+            X = ret_window.values
+            n_win_local, n_inst = X.shape
+            w = weights.reshape(-1, 1, 1)
+            isvalid = ~np.isnan(X)
+            X = np.nan_to_num(X, nan=0.0)
+            valid_i = isvalid[:, :, np.newaxis]
+            valid_j = isvalid[:, np.newaxis, :]
+            common_valid = valid_i & valid_j
+            w_common = w * common_valid.astype(float)
+            w_sum_ij = np.sum(w_common, axis=0)
+            denom = np.where(w_sum_ij > 0, w_sum_ij, np.nan)
+            X_i = X[:, :, np.newaxis]
+            X_j = X[:, np.newaxis, :]
+            mean_i = np.sum(w_common * X_i, axis=0) / denom
+            mean_j = np.sum(w_common * X_j, axis=0) / denom
+            prod = np.sum(w_common * X_i * X_j, axis=0) / denom
+            cov_np = prod - mean_i * mean_j
+            valid_count = np.sum(common_valid, axis=0)
+            cov_np[valid_count < 2] = np.nan
+            cov_matrix[:] = cov_np
         cov_list.append(cov_matrix)
     
     cov_df = pd.concat(cov_list, keys=returns.index)
