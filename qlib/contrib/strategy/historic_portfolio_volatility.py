@@ -77,21 +77,28 @@ def generate_weights(n: int, method: str = 'ma', half_life: int = None) -> np.nd
 
 def weighted_covariance(x: pd.Series, y: pd.Series, weights: np.ndarray) -> float:
     """
-    Calculate weighted covariance between x and y.
-    
-    Parameters:
-    - x, y: pd.Series of same length.
-    - weights: np.ndarray of weights.
-    
-    Returns:
-    - float covariance.
+    Calculate weighted covariance between x and y, ignoring NaNs.
     """
-    if len(x) != len(y) or len(x) != len(weights):
-        raise ValueError("Input lengths mismatch.")
+    x_vals = x.values
+    y_vals = y.values
+    
+    valid_mask = ~np.isnan(x_vals) & ~np.isnan(y_vals)
+    
+    if np.sum(valid_mask) < 2:
+        return np.nan
+
+    x_vals = x_vals[valid_mask]
+    y_vals = y_vals[valid_mask]
+    weights = weights[valid_mask]
+    
     w_sum = weights.sum()
-    mean_x = (weights * x).sum() / w_sum
-    mean_y = (weights * y).sum() / w_sum
-    cov = (weights * x * y).sum() / w_sum - mean_x * mean_y
+    if w_sum == 0:
+        return np.nan
+
+    mean_x = np.sum(x_vals * weights) / w_sum
+    mean_y = np.sum(y_vals * weights) / w_sum
+    
+    cov = np.sum(weights * (x_vals - mean_x) * (y_vals - mean_y)) / w_sum
     return cov
 
 def historical_covariance(returns: pd.DataFrame, window: int = 20, method: str = 'ma', half_life: int = None, back_fill: bool = True) -> pd.DataFrame:
@@ -109,6 +116,7 @@ def historical_covariance(returns: pd.DataFrame, window: int = 20, method: str =
     - pd.DataFrame with MultiIndex (datetime, instrument1, instrument2) and 'covariance' column.
     """
     instruments = returns.columns
+    n_inst = len(instruments)
     cov_list = []
     for t in range(len(returns)):
         start = max(0, t - window + 1)
@@ -118,31 +126,18 @@ def historical_covariance(returns: pd.DataFrame, window: int = 20, method: str =
             cov_matrix = pd.DataFrame(np.nan, index=instruments, columns=instruments)
         else:
             weights = generate_weights(n_win, method, half_life)
-            cov_matrix = pd.DataFrame(index=instruments, columns=instruments)
-            X = ret_window.values
-            n_win_local, n_inst = X.shape
-            w = weights.reshape(-1, 1, 1)
-            isvalid = ~np.isnan(X)
-            X = np.nan_to_num(X, nan=0.0)
-            valid_i = isvalid[:, :, np.newaxis]
-            valid_j = isvalid[:, np.newaxis, :]
-            common_valid = valid_i & valid_j
-            w_common = w * common_valid.astype(float)
-            w_sum_ij = np.sum(w_common, axis=0)
-            denom = np.where(w_sum_ij > 0, w_sum_ij, np.nan)
-            X_i = X[:, :, np.newaxis]
-            X_j = X[:, np.newaxis, :]
-            mean_i = np.sum(w_common * X_i, axis=0) / denom
-            mean_j = np.sum(w_common * X_j, axis=0) / denom
-            prod = np.sum(w_common * X_i * X_j, axis=0) / denom
-            cov_np = prod - mean_i * mean_j
-            valid_count = np.sum(common_valid, axis=0)
-            cov_np[valid_count < 2] = np.nan
-            cov_matrix[:] = cov_np
+            cov_matrix = pd.DataFrame(np.nan, index=instruments, columns=instruments, dtype=float)
+            for i in range(n_inst):
+                for j in range(i, n_inst):
+                    inst1 = instruments[i]
+                    inst2 = instruments[j]
+                    cov = weighted_covariance(ret_window[inst1], ret_window[inst2], weights)
+                    cov_matrix.loc[inst1, inst2] = cov
+                    cov_matrix.loc[inst2, inst1] = cov
         cov_list.append(cov_matrix)
     
     cov_df = pd.concat(cov_list, keys=returns.index)
-    return cov_df.stack().to_frame('covariance')
+    return cov_df.stack(future_stack=True).to_frame('covariance')
 
 def get_annualization_factor(frequency: str) -> float:
     """

@@ -100,12 +100,14 @@ def test_compute_portfolio_metrics(mock_D, sample_returns):
     # Use fixed prices derived from returns
     prices_A = np.exp(np.cumsum(sample_returns['A'].fillna(0)))
     prices_B = np.exp(np.cumsum(sample_returns['B'].fillna(0)))
+    
+    # Create mock data with correct structure - instrument as index, datetime as columns
     mock_data = pd.DataFrame({
         '$close': np.concatenate([prices_A, prices_B])
-    }, index=pd.MultiIndex.from_product([dates, instruments], names=['datetime', 'instrument']))
+    }, index=pd.MultiIndex.from_product([instruments, dates], names=['instrument', 'datetime']))
     mock_data = mock_data.sort_index()
     mock_D.features.return_value = mock_data
-    
+
     instruments_list = instruments
     start_time = dates[0]
     end_time = dates[-1]
@@ -115,7 +117,10 @@ def test_compute_portfolio_metrics(mock_D, sample_returns):
     assert metrics['volatility'].shape == (10, 2)
     
     # Numerical validation for volatility
-    expected_vol_A = np.sqrt(np.var(sample_returns['A'].iloc[-5:], ddof=0)) * np.sqrt(252)
+    expected_cov_A = np.nanvar(sample_returns['A'].iloc[-5:], ddof=0)
+    print(f"Calculated cov: {metrics['covariance'].loc[(dates[-1], 'A', 'A'), 'covariance']}")
+    print(f"Expected cov: {expected_cov_A}")
+    expected_vol_A = np.sqrt(expected_cov_A) * np.sqrt(252)
     assert metrics['volatility']['A'].iloc[-1] == pytest.approx(expected_vol_A, rel=1e-4)
     
     weights = pd.DataFrame(np.full((10, 2), 0.5), index=dates, columns=instruments)
