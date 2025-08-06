@@ -19,15 +19,11 @@ from unittest.mock import patch
 @pytest.fixture
 def sample_returns():
     dates = pd.date_range('2023-01-01', periods=10)
-    log_returns = {
-        'A': np.random.randn(10),
-        'B': np.random.randn(10),
+    data = {
+        'A': [np.nan, 0.01, 0.02, -0.01, 0.03, 0.00, 0.01, -0.02, 0.04, -0.01],
+        'B': [np.nan, 0.02, 0.01, 0.00, -0.01, 0.03, 0.02, 0.01, -0.02, 0.03],
     }
-    prices = pd.DataFrame({
-        'A': np.exp(np.cumsum(log_returns['A'])),
-        'B': np.exp(np.cumsum(log_returns['B'])),
-    }, index=dates)
-    returns = calculate_returns(prices)
+    returns = pd.DataFrame(data, index=dates)
     return returns
 
 def test_generate_weights_ma():
@@ -59,11 +55,13 @@ def test_weighted_covariance_mismatch_length():
 def test_historical_covariance(sample_returns):
     cov = historical_covariance(sample_returns, window=5, method='ma')
     assert isinstance(cov, pd.DataFrame)
-    assert cov.shape[0] == 10 * 2 * 2  # 10 times, 2 inst, 2 inst
-    # Check one value
+    assert cov.shape[0] == 40  # 10 times, 2 inst, 2 inst
+    # Numerical validation for a specific time point
     t = sample_returns.index[4]
-    cov_matrix = cov.loc[(t, slice(None), slice(None)), 'covariance'].unstack()
-    assert cov_matrix.shape == (2, 2)
+    cov_matrix = cov.xs(t, level=0)['covariance'].unstack()
+    expected_cov_AA = np.nanvar(sample_returns['A'].iloc[0:5], ddof=0)  # population variance since weighted_cov uses sum(w) as denom
+    assert cov_matrix.loc['A', 'A'] == pytest.approx(expected_cov_AA, rel=1e-6)
+    # Add more checks as needed
 
 def test_historical_covariance_back_fill(sample_returns):
     cov = historical_covariance(sample_returns.iloc[:3], window=5, back_fill=True)
@@ -99,13 +97,12 @@ def test_portfolio_volatility():
 def test_compute_portfolio_metrics(mock_D, sample_returns):
     dates = sample_returns.index
     instruments = ['A', 'B']
-    mock_data = pd.DataFrame(
-        index=pd.MultiIndex.from_product([dates, instruments], names=['datetime', 'instrument']),
-        columns=['$close'],
-        dtype=float
-    )
-    mock_data.loc[(slice(None), 'A'), '$close'] = np.random.uniform(1, 100, len(dates))  # Positive prices
-    mock_data.loc[(slice(None), 'B'), '$close'] = np.random.uniform(1, 100, len(dates))
+    # Use fixed prices derived from returns
+    prices_A = np.exp(np.cumsum(sample_returns['A'].fillna(0)))
+    prices_B = np.exp(np.cumsum(sample_returns['B'].fillna(0)))
+    mock_data = pd.DataFrame({
+        '$close': np.concatenate([prices_A, prices_B])
+    }, index=pd.MultiIndex.from_product([dates, instruments], names=['datetime', 'instrument']))
     mock_data = mock_data.sort_index()
     mock_D.features.return_value = mock_data
     
@@ -117,10 +114,21 @@ def test_compute_portfolio_metrics(mock_D, sample_returns):
     assert 'covariance' in metrics
     assert metrics['volatility'].shape == (10, 2)
     
+    # Numerical validation for volatility
+    expected_vol_A = np.sqrt(np.var(sample_returns['A'].iloc[-5:], ddof=0)) * np.sqrt(252)
+    assert metrics['volatility']['A'].iloc[-1] == pytest.approx(expected_vol_A, rel=1e-4)
+    
     weights = pd.DataFrame(np.full((10, 2), 0.5), index=dates, columns=instruments)
     metrics_with_port = compute_portfolio_metrics(instruments_list, start_time, end_time, frequency='day', vol_window=5, weights=weights, method='ma')
     assert 'portfolio_vol' in metrics_with_port
     assert len(metrics_with_port['portfolio_vol']) == 10
+    
+    # Numerical validation for portfolio vol
+    # For simplicity, check the last value
+    last_cov = metrics_with_port['covariance'].xs(dates[-1], level=0)['covariance'].unstack()
+    w = np.array([0.5, 0.5])
+    expected_port_vol = np.sqrt(w.T @ last_cov.values @ w) * np.sqrt(252)
+    assert metrics_with_port['portfolio_vol'].iloc[-1] == pytest.approx(expected_port_vol, rel=1e-4)
 
 def test_resample_returns(sample_returns):
     weekly = resample_returns(sample_returns, 'week')
