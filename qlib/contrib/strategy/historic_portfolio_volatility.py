@@ -196,7 +196,7 @@ def compute_portfolio_metrics(
     - dict with 'volatility' (pd.DataFrame), 'covariance' (pd.DataFrame), and optionally 'portfolio_vol' (pd.Series).
     """
     prices = D.features(instruments, ['$close'], start_time=start_time, end_time=end_time, freq=frequency)
-    prices = prices['$close'].unstack(level=1).astype(float)
+    prices = prices['$close'].unstack(level=0).astype(float)
     
     returns = calculate_returns(prices)
     resampled_returns = resample_returns(returns, frequency)

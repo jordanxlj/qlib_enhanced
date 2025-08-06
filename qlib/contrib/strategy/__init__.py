@@ -6,6 +6,7 @@ from .signal_strategy import (
     TopkDropoutStrategy,
     WeightStrategyBase,
     EnhancedIndexingStrategy,
+    VolTopkDropoutStrategy,
 )
 
 from .rule_strategy import (
@@ -25,4 +26,5 @@ __all__ = [
     "SBBStrategyBase",
     "SBBStrategyEMA",
     "SoftTopkStrategy",
+    "VolTopkDropoutStrategy",
 ]

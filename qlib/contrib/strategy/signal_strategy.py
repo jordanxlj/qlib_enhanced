@@ -20,8 +20,7 @@ from qlib.log import get_module_logger
 from qlib.utils import get_pre_trading_date, load_dataset
 from qlib.contrib.strategy.order_generator import OrderGenerator, OrderGenWOInteract
 from qlib.contrib.strategy.optimizer import EnhancedIndexingOptimizer
-from qlib.contrib.strategy.historic_portfolio_volatility import portfolio_volatility, get_annualization_factor
-
+from qlib.contrib.strategy.historic_portfolio_volatility import portfolio_volatility, get_annualization_factor, compute_portfolio_metrics
 
 
 class BaseSignalStrategy(BaseStrategy, ABC):
@@ -565,15 +564,12 @@ class VolTopkDropoutStrategy(WeightStrategyBase):
 
     def _compute_portfolio_volatility(self):
         """Compute portfolio volatility metrics using historic_portfolio_volatility module."""
-        from qlib.contrib.strategy.historic_portfolio_volatility import compute_portfolio_metrics
-        from qlib.data import D
-
         trade_len = self.trade_calendar.get_trade_len()
         signal_start_time, _ = self.trade_calendar.get_step_time(trade_step=0, shift=1)
         _, signal_end_time = self.trade_calendar.get_step_time(trade_step=trade_len - 1, shift=1)
 
         # Get all instruments from the universe
-        instruments = D.instruments("all")
+        instruments = D.instruments("csi300")
 
         # Compute portfolio metrics
         self.vol_metrics = compute_portfolio_metrics(
