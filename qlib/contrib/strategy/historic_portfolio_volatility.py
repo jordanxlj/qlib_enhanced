@@ -76,60 +76,44 @@ def generate_weights(n: int, method: str = 'ma', half_life: int = None) -> np.nd
         raise ValueError("Unsupported method. Use 'ma' or 'xma'.")
 
 def historical_covariance(returns: pd.DataFrame, window: int = 20, method: str = 'ma', half_life: int = None, back_fill: bool = True) -> pd.DataFrame:
-    """
-    Calculate rolling weighted covariance matrix for each time step.
+    """    Calculate rolling weighted covariance matrix for each time step.
     This implementation is vectorized to improve performance by reducing loops over instruments.
-
     Parameters:
     - returns: pd.DataFrame of returns (rows: time, columns: instruments).
     - window: int, rolling window size.
     - method: str, 'ma' or 'xma'.
     - half_life: int, for 'xma'.
     - back_fill: bool, if True, compute for windows smaller than 'window' using available data.
-
     Returns:
     - pd.DataFrame with MultiIndex (datetime, instrument1, instrument2) and 'covariance' column.
     """
     instruments = returns.columns
     p = len(instruments)
-
     def _weighted_cov_vectorized(R: np.ndarray, w: np.ndarray) -> np.ndarray:
         n, p = R.shape
-        
         # Masked array for returns
         R_masked = np.ma.masked_invalid(R)
-        
         # Weighted means
         mean_vec = np.ma.average(R_masked, axis=0, weights=w).filled(np.nan)
-
-        # Weighted E[XY]
-        XY_num = np.zeros((p, p))
-        W_sum_mat = np.zeros((p, p))
-        num_valid_pairs = np.zeros((p, p))
-
-        for k in range(n):
-            w_k = w[k]
-            r_k = R[k, :]
-            
-            valid_k = ~np.isnan(r_k)
-            pair_valid_k = np.outer(valid_k, valid_k)
-            
-            num_valid_pairs += pair_valid_k
-            W_sum_mat += w_k * pair_valid_k
-            
-            r_k_no_nan = np.nan_to_num(r_k)
-            XY_num += w_k * np.outer(r_k_no_nan, r_k_no_nan) * pair_valid_k
-        
-        # To avoid division by zero
+        # Vectorized computation
+        R_no_nan = np.nan_to_num(R)
+        valid = ~np.isnan(R)
+        pair_valid = np.logical_and(valid[:, None, :], valid[:, :, None]).astype(float)  # n x p x p
+        w_broadcast = w[:, None, None]  # n x 1 x 1
+        # Weighted sum for XY
+        outer_products = R_no_nan[:, :, None] * R_no_nan[:, None, :]  # n x p x p
+        XY_num = np.sum(w_broadcast * outer_products * pair_valid, axis=0)  # p x p
+        # Weighted sum for normalization
+        W_sum_mat = np.sum(w_broadcast * pair_valid, axis=0)  # p x p
         W_sum_mat_safe = np.where(W_sum_mat == 0, np.nan, W_sum_mat)
+        # Number of valid pairs
+        num_valid_pairs = np.sum(pair_valid, axis=0)  # p x p
+        # E[XY]
         E_XY = XY_num / W_sum_mat_safe
-        
         # Covariance
         cov = E_XY - np.outer(mean_vec, mean_vec)
-        
         # Set cov to nan for pairs with less than 2 common observations
         cov[num_valid_pairs < 2] = np.nan
-        
         return cov
 
     cov_list = []
@@ -145,7 +129,6 @@ def historical_covariance(returns: pd.DataFrame, window: int = 20, method: str =
             cov_matrix = pd.DataFrame(cov_matrix_np, index=instruments, columns=instruments)
         
         cov_list.append(cov_matrix)
-    
     cov_df = pd.concat(cov_list, keys=returns.index)
     return cov_df.stack(future_stack=True).to_frame('covariance')
 

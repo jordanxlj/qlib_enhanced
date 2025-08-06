@@ -626,8 +626,10 @@ class VolTopkDropoutStrategy(WeightStrategyBase):
                     ann_factor = get_annualization_factor(self.frequency)
                     annualized_vol = port_vol_series.iloc[0] * ann_factor
 
-                    if annualized_vol > 1e-6:
+                    # adjust only when annualized_vol is greater than target.
+                    if annualized_vol > self.target_volatility:
                         adjustment = self.target_volatility / annualized_vol
+                        print(f"adjust volatility to {adjustment} by {annualized_vol}")
                         risk_degree *= adjustment
 
         order_list = self.order_generator.generate_order_list_from_target_weight_position(
