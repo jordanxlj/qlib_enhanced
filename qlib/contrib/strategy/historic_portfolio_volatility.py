@@ -75,48 +75,63 @@ def generate_weights(n: int, method: str = 'ma', half_life: int = None) -> np.nd
     else:
         raise ValueError("Unsupported method. Use 'ma' or 'xma'.")
 
-def weighted_covariance(x: pd.Series, y: pd.Series, weights: np.ndarray) -> float:
-    """
-    Calculate weighted covariance between x and y, ignoring NaNs.
-    """
-    x_vals = x.values
-    y_vals = y.values
-    
-    valid_mask = ~np.isnan(x_vals) & ~np.isnan(y_vals)
-    
-    if np.sum(valid_mask) < 2:
-        return np.nan
-
-    x_vals = x_vals[valid_mask]
-    y_vals = y_vals[valid_mask]
-    weights = weights[valid_mask]
-    
-    w_sum = weights.sum()
-    if w_sum == 0:
-        return np.nan
-
-    mean_x = np.sum(x_vals * weights) / w_sum
-    mean_y = np.sum(y_vals * weights) / w_sum
-    
-    cov = np.sum(weights * (x_vals - mean_x) * (y_vals - mean_y)) / w_sum
-    return cov
-
 def historical_covariance(returns: pd.DataFrame, window: int = 20, method: str = 'ma', half_life: int = None, back_fill: bool = True) -> pd.DataFrame:
     """
     Calculate rolling weighted covariance matrix for each time step.
-    
+    This implementation is vectorized to improve performance by reducing loops over instruments.
+
     Parameters:
     - returns: pd.DataFrame of returns (rows: time, columns: instruments).
     - window: int, rolling window size.
     - method: str, 'ma' or 'xma'.
     - half_life: int, for 'xma'.
     - back_fill: bool, if True, compute for windows smaller than 'window' using available data.
-    
+
     Returns:
     - pd.DataFrame with MultiIndex (datetime, instrument1, instrument2) and 'covariance' column.
     """
     instruments = returns.columns
-    n_inst = len(instruments)
+    p = len(instruments)
+
+    def _weighted_cov_vectorized(R: np.ndarray, w: np.ndarray) -> np.ndarray:
+        n, p = R.shape
+        
+        # Masked array for returns
+        R_masked = np.ma.masked_invalid(R)
+        
+        # Weighted means
+        mean_vec = np.ma.average(R_masked, axis=0, weights=w).filled(np.nan)
+
+        # Weighted E[XY]
+        XY_num = np.zeros((p, p))
+        W_sum_mat = np.zeros((p, p))
+        num_valid_pairs = np.zeros((p, p))
+
+        for k in range(n):
+            w_k = w[k]
+            r_k = R[k, :]
+            
+            valid_k = ~np.isnan(r_k)
+            pair_valid_k = np.outer(valid_k, valid_k)
+            
+            num_valid_pairs += pair_valid_k
+            W_sum_mat += w_k * pair_valid_k
+            
+            r_k_no_nan = np.nan_to_num(r_k)
+            XY_num += w_k * np.outer(r_k_no_nan, r_k_no_nan) * pair_valid_k
+        
+        # To avoid division by zero
+        W_sum_mat_safe = np.where(W_sum_mat == 0, np.nan, W_sum_mat)
+        E_XY = XY_num / W_sum_mat_safe
+        
+        # Covariance
+        cov = E_XY - np.outer(mean_vec, mean_vec)
+        
+        # Set cov to nan for pairs with less than 2 common observations
+        cov[num_valid_pairs < 2] = np.nan
+        
+        return cov
+
     cov_list = []
     for t in range(len(returns)):
         start = max(0, t - window + 1)
@@ -126,14 +141,9 @@ def historical_covariance(returns: pd.DataFrame, window: int = 20, method: str =
             cov_matrix = pd.DataFrame(np.nan, index=instruments, columns=instruments)
         else:
             weights = generate_weights(n_win, method, half_life)
-            cov_matrix = pd.DataFrame(np.nan, index=instruments, columns=instruments, dtype=float)
-            for i in range(n_inst):
-                for j in range(i, n_inst):
-                    inst1 = instruments[i]
-                    inst2 = instruments[j]
-                    cov = weighted_covariance(ret_window[inst1], ret_window[inst2], weights)
-                    cov_matrix.loc[inst1, inst2] = cov
-                    cov_matrix.loc[inst2, inst1] = cov
+            cov_matrix_np = _weighted_cov_vectorized(ret_window.values, weights)
+            cov_matrix = pd.DataFrame(cov_matrix_np, index=instruments, columns=instruments)
+        
         cov_list.append(cov_matrix)
     
     cov_df = pd.concat(cov_list, keys=returns.index)
@@ -212,7 +222,7 @@ def compute_portfolio_metrics(
     
     returns = calculate_returns(prices)
     resampled_returns = resample_returns(returns, frequency)
-    
+
     cov = historical_covariance(resampled_returns, vol_window, method, half_life, back_fill)
     
     # Volatility from diagonal of cov

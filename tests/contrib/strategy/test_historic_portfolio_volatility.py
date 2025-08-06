@@ -6,7 +6,6 @@ import pandas as pd
 import numpy as np
 from qlib.contrib.strategy.historic_portfolio_volatility import (
     generate_weights,
-    weighted_covariance,
     historical_covariance,
     get_annualization_factor,
     portfolio_volatility,
@@ -41,16 +40,7 @@ def test_generate_weights_invalid_method():
     with pytest.raises(ValueError):
         generate_weights(5, method='invalid')
 
-def test_weighted_covariance():
-    x = pd.Series([1, 2, 3])
-    y = pd.Series([4, 5, 6])
-    weights = np.array([0.2, 0.3, 0.5])
-    cov = weighted_covariance(x, y, weights)
-    assert cov == pytest.approx(0.61)  # Corrected: weighted cov = 0.61
 
-def test_weighted_covariance_mismatch_length():
-    with pytest.raises(ValueError):
-        weighted_covariance(pd.Series([1,2]), pd.Series([3,4,5]), np.array([0.1, 0.2]))
 
 def test_historical_covariance(sample_returns):
     cov = historical_covariance(sample_returns, window=5, method='ma')
