@@ -628,18 +628,11 @@ class VolTopkDropoutStrategy(WeightStrategyBase):
                     ann_factor = get_annualization_factor(self.frequency)
                     annualized_vol = port_vol_series.iloc[0] * ann_factor
 
-                    # New logic to adjust based on volatility trend using EMA for more sensitivity
-                    vol_series = self.vol_metrics['volatility'].mean(axis=1)  # Use mean volatility across all assets
-                    if len(vol_series) > 5:  # Need enough data to determine trend
-                        # Use EMA instead of SMA for better responsiveness to recent changes
-                        ema_short = vol_series.ewm(span=3, adjust=False).mean().iloc[-1]
-                        ema_long = vol_series.ewm(span=6, adjust=False).mean().iloc[-1]
-
-                        # Relaxed condition: <= to include flat trends as potentially downward
-                        if ema_short <= ema_long and annualized_vol > self.target_volatility:
-                            adjustment = self.target_volatility / annualized_vol
-                            print(f"adjust volatility to {adjustment} by {annualized_vol}")
-                            risk_degree *= adjustment
+                    # adjust only when annualized_vol is greater than target.
+                    if annualized_vol > self.target_volatility:
+                        adjustment = self.target_volatility / annualized_vol
+                        print(f"adjust volatility to {adjustment} by {annualized_vol}")
+                        risk_degree *= adjustment
 
         order_list = self.order_generator.generate_order_list_from_target_weight_position(
             current=current_temp,
