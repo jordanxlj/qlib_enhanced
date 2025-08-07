@@ -540,7 +540,7 @@ class VolTopkDropoutStrategy(WeightStrategyBase):
         hold_thresh=1,
         only_tradable=False,
         forbid_all_trade_at_limit=True,
-        vol_window=20,
+        vol_window=5,
         vol_method="ma",
         vol_half_life=11,
         frequency="day",
@@ -562,7 +562,6 @@ class VolTopkDropoutStrategy(WeightStrategyBase):
         self.frequency = frequency
         self.target_volatility = target_volatility
         self.vol_metrics = None
-        self.position_weight = position_weight
 
     def _compute_portfolio_volatility(self):
         """Compute portfolio volatility metrics using historic_portfolio_volatility module."""
@@ -628,11 +627,11 @@ class VolTopkDropoutStrategy(WeightStrategyBase):
                     ann_factor = get_annualization_factor(self.frequency)
                     annualized_vol = port_vol_series.iloc[0] * ann_factor
 
-                    # adjust only when annualized_vol is greater than target.
-                    if annualized_vol > self.target_volatility:
-                        adjustment = self.target_volatility / annualized_vol
-                        print(f"adjust volatility to {adjustment} by {annualized_vol}")
-                        risk_degree *= adjustment
+                    # # adjust only when annualized_vol is greater than target.
+                    # if annualized_vol > self.target_volatility:
+                    #     adjustment = self.target_volatility / annualized_vol
+                    #     print(f"adjust volatility to {adjustment} by {annualized_vol}")
+                    #     risk_degree *= adjustment
 
         order_list = self.order_generator.generate_order_list_from_target_weight_position(
             current=current_temp,
@@ -648,51 +647,50 @@ class VolTopkDropoutStrategy(WeightStrategyBase):
 
     def _calculate_weights(self, target_codes, trade_start_time):
         """
-        Calculate weights for target_codes based on the specified position_weight.
+        Calculate weights for target_codes based on inverse volatility.
         """
-        if self.position_weight == 'average':
+        if self.vol_window <= 0 or self.vol_metrics is None:
+            raise ValueError("Volatility window or metrics not set for inverse volatility weighting.")
+        vol = {}
+        volatility_df = self.vol_metrics["volatility"]
+
+        # Find the closest available date for volatility data
+        available_dates = volatility_df.index
+        if trade_start_time not in available_dates:
+            # Find the closest previous date
+            before_dates = available_dates[available_dates <= trade_start_time]
+            if len(before_dates) > 0:
+                closest_date = before_dates[-1]
+            else:
+                closest_date = available_dates[0]
+        else:
+            closest_date = trade_start_time
+
+        # Define minimum volatility threshold to prevent extreme inverse values
+        min_vol_threshold = 0.01  # 1% minimum volatility
+        
+        for code in target_codes:
+            if code in volatility_df.columns:
+                v = volatility_df.loc[closest_date, code]
+                if not pd.isna(v) and v > 0:
+                    # Apply minimum threshold to prevent extreme inverse values
+                    vol[code] = max(v, min_vol_threshold)
+
+        if not vol:
             weight = 1.0 / len(target_codes) if target_codes else 0
             return {code: weight for code in target_codes}
-        elif self.position_weight == 'inverse_vol':
-            if self.vol_window <= 0 or self.vol_metrics is None:
-                raise ValueError("Volatility window or metrics not set for inverse volatility weighting.")
-            vol = {}
-            volatility_df = self.vol_metrics["volatility"]
 
-            # Find the closest available date for volatility data
-            available_dates = volatility_df.index
-            if trade_start_time not in available_dates:
-                # Find the closest previous date
-                before_dates = available_dates[available_dates <= trade_start_time]
-                if len(before_dates) > 0:
-                    closest_date = before_dates[-1]
-                else:
-                    closest_date = available_dates[0]
-            else:
-                closest_date = trade_start_time
+        # For stocks without volatility data, use maximum observed volatility (but at least min_threshold)
+        max_vol = max(max(vol.values()), min_vol_threshold) if vol else min_vol_threshold
+        for code in target_codes:
+            if code not in vol:
+                vol[code] = max_vol
 
-            for code in target_codes:
-                if code in volatility_df.columns:
-                    v = volatility_df.loc[closest_date, code]
-                    if not pd.isna(v) and v > 0:
-                        vol[code] = v
-
-            if not vol:
-                weight = 1.0 / len(target_codes) if target_codes else 0
-                return {code: weight for code in target_codes}
-
-            # For stocks without volatility data, use maximum observed volatility
-            max_vol = max(vol.values()) if vol else 1.0
-            for code in target_codes:
-                if code not in vol:
-                    vol[code] = max_vol
-
-            # Inverse volatility weighting
-            inv_vol = {code: 1 / v for code, v in vol.items()}
-            total_inv = sum(inv_vol.values())
-            return {code: iv / total_inv for code, iv in inv_vol.items()}
-        else:
-            raise ValueError(f"Invalid position_weight: {self.position_weight}")
+        #import pdb; pdb.set_trace()
+        # Inverse volatility weighting with capped values
+        inv_vol = {code: 1 / v for code, v in vol.items()}
+        total_inv = sum(inv_vol.values())
+        return {code: iv / total_inv for code, iv in inv_vol.items()}
 
     def generate_target_weight_position(self, score, current, trade_start_time, trade_end_time):
         pred_score = score
