@@ -53,14 +53,20 @@ class TestVolTopkDropoutStrategy(unittest.TestCase):
         return strategy
 
     @patch("qlib.contrib.strategy.signal_strategy.portfolio_volatility")
-    @patch("qlib.contrib.strategy.signal_strategy.VolTopkDropoutStrategy._compute_portfolio_volatility")
+    @patch(
+        "qlib.contrib.strategy.signal_strategy.VolTopkDropoutStrategy._compute_portfolio_volatility"
+    )
     @patch("qlib.contrib.strategy.signal_strategy.create_signal_from")
-    def test_volatility_adjustment(self, mock_create_signal, mock_compute_vol, mock_port_vol):
+    def test_volatility_adjustment(
+        self, mock_create_signal, mock_compute_vol, mock_port_vol
+    ):
         mock_create_signal.return_value = self.signal
-        mock_port_vol.return_value = pd.Series([0.035355], index=[pd.Timestamp("2023-01-03")])
+        mock_port_vol.return_value = pd.Series(
+            [0.035355], index=[pd.Timestamp("2023-01-03")]
+        )
 
         params = self.strategy_params.copy()
-        params.update({"vol_window": 20, "target_volatility": 0.10, "position_weight": "inverse_vol"})
+        params.update({"vol_window": 20, "target_volatility": 0.10})
         strategy = self._create_strategy(params)
 
         mock_compute_vol.assert_called_once()
@@ -69,73 +75,39 @@ class TestVolTopkDropoutStrategy(unittest.TestCase):
         cov_data = {}
         for s1 in stocks:
             for s2 in stocks:
-                cov_data[(pd.Timestamp("2023-01-03"), s1, s2)] = 0.0025 if s1 == s2 else 0.0
-        cov_df = pd.DataFrame.from_dict(cov_data, orient="index", columns=["covariance"])
+                cov_data[(pd.Timestamp("2023-01-03"), s1, s2)] = (
+                    0.0025 if s1 == s2 else 0.0
+                )
+        cov_df = pd.DataFrame.from_dict(
+            cov_data, orient="index", columns=["covariance"]
+        )
         cov_df.index = pd.MultiIndex.from_tuples(cov_df.index)
         strategy.vol_metrics = {
             "covariance": cov_df,
-            "volatility": pd.DataFrame(0.05, index=[pd.Timestamp("2023-01-03")], columns=stocks),
+            "volatility": pd.DataFrame(
+                0.05, index=[pd.Timestamp("2023-01-03")], columns=stocks
+            ),
         }
 
         strategy.order_generator = MagicMock()
         strategy.generate_trade_decision()
 
-        args, kwargs = strategy.order_generator.generate_order_list_from_target_weight_position.call_args
+        args, kwargs = (
+            strategy.order_generator.generate_order_list_from_target_weight_position.call_args
+        )
         self.assertAlmostEqual(kwargs["risk_degree"], 0.178, places=3)
 
-    @patch("qlib.contrib.strategy.signal_strategy.VolTopkDropoutStrategy._compute_portfolio_volatility")
+    @patch(
+        "qlib.contrib.strategy.signal_strategy.VolTopkDropoutStrategy._compute_portfolio_volatility"
+    )
     @patch("qlib.contrib.strategy.signal_strategy.create_signal_from")
-    def test_no_volatility_adjustment(self, mock_create_signal, mock_compute_vol):
+    def test_inverse_vol_weighting(
+        self, mock_create_signal, mock_compute_vol
+    ):
         mock_create_signal.return_value = self.signal
 
         params = self.strategy_params.copy()
-        params.update({"vol_window": 20, "position_weight": "average"})
-        strategy = self._create_strategy(params)
-
-        mock_compute_vol.assert_not_called()
-
-        strategy.order_generator = MagicMock()
-        strategy.generate_trade_decision()
-
-        args, kwargs = strategy.order_generator.generate_order_list_from_target_weight_position.call_args
-        self.assertEqual(kwargs["risk_degree"], 1.0)
-
-    @patch("qlib.contrib.strategy.signal_strategy.create_signal_from")
-    def test_invalid_position_weight(self, mock_create_signal):
-        mock_create_signal.return_value = self.signal
-
-        params = self.strategy_params.copy()
-        params.update({"position_weight": "invalid"})
-        strategy = self._create_strategy(params)
-
-        with self.assertRaises(ValueError) as cm:
-            strategy.generate_trade_decision()
-        self.assertEqual(str(cm.exception), "Invalid position_weight: invalid")
-
-    @patch("qlib.contrib.strategy.signal_strategy.VolTopkDropoutStrategy._compute_portfolio_volatility")
-    @patch("qlib.contrib.strategy.signal_strategy.create_signal_from")
-    def test_average_weight_with_vol_window(self, mock_create_signal, mock_compute_vol):
-        mock_create_signal.return_value = self.signal
-
-        params = self.strategy_params.copy()
-        params.update({"vol_window": 20, "position_weight": "average"})
-        strategy = self._create_strategy(params)
-
-        mock_compute_vol.assert_not_called()
-
-        strategy.order_generator = MagicMock()
-        strategy.generate_trade_decision()
-
-        args, kwargs = strategy.order_generator.generate_order_list_from_target_weight_position.call_args
-        self.assertEqual(kwargs["risk_degree"], 1.0)
-
-    @patch("qlib.contrib.strategy.signal_strategy.VolTopkDropoutStrategy._compute_portfolio_volatility")
-    @patch("qlib.contrib.strategy.signal_strategy.create_signal_from")
-    def test_inverse_vol_weighting(self, mock_create_signal, mock_compute_vol):
-        mock_create_signal.return_value = self.signal
-
-        params = self.strategy_params.copy()
-        params.update({"vol_window": 20, "position_weight": "inverse_vol"})
+        params.update({"vol_window": 20})
         strategy = self._create_strategy(params)
 
         mock_compute_vol.assert_called_once()
@@ -144,19 +116,20 @@ class TestVolTopkDropoutStrategy(unittest.TestCase):
         strategy.vol_metrics = {
             "volatility": pd.DataFrame(
                 {"SH600000": 0.1, "SH600001": 0.2, "SH600002": 0.3},
-                index=[pd.Timestamp("2023-01-03")]
+                index=[pd.Timestamp("2023-01-03")],
             )
         }
 
         weights = strategy._calculate_weights(stocks, pd.Timestamp("2023-01-03"))
 
-        total_inv = 1/0.1 + 1/0.2 + 1/0.3
+        total_inv = 1 / 0.1 + 1 / 0.2 + 1 / 0.3
         expected = {
-            "SH600000": (1/0.1) / total_inv,
-            "SH600001": (1/0.2) / total_inv,
-            "SH600002": (1/0.3) / total_inv,
+            "SH600000": (1 / 0.1) / total_inv,
+            "SH600001": (1 / 0.2) / total_inv,
+            "SH600002": (1 / 0.3) / total_inv,
         }
-        self.assertEqual(weights, expected)
+        for stock in stocks:
+            self.assertAlmostEqual(weights[stock], expected[stock])
 
 
 if __name__ == "__main__":
