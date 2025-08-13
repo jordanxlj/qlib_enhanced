@@ -424,6 +424,7 @@ class PortAnaRecord(ACRecordTemp):
         config = deepcopy_basic_type(config)
 
         self.strategy_config = config["strategy"]
+        self.position_config = config["position_manager"] if "position_manager" in config else None
         _default_executor_config = {
             "class": "SimulatorExecutor",
             "module_path": "qlib.backtest.executor",
@@ -481,7 +482,7 @@ class PortAnaRecord(ACRecordTemp):
         artifact_objects = {}
         # custom strategy and get backtest
         portfolio_metric_dict, indicator_dict = normal_backtest(
-            executor=self.executor_config, strategy=self.strategy_config, **self.backtest_config
+            executor=self.executor_config, strategy=self.strategy_config, position=self.position_config, **self.backtest_config
         )
         for _freq, (report_normal, positions_normal) in portfolio_metric_dict.items():
             artifact_objects.update({f"report_normal_{_freq}.pkl": report_normal})

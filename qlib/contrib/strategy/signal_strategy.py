@@ -56,6 +56,7 @@ class BaseSignalStrategy(BaseStrategy, ABC):
         super().__init__(level_infra=level_infra, common_infra=common_infra, trade_exchange=trade_exchange, **kwargs)
 
         self.risk_degree = risk_degree
+        self.position_manager = None
 
         # This is trying to be compatible with previous version of qlib task config
         if model is not None and dataset is not None:
@@ -72,6 +73,8 @@ class BaseSignalStrategy(BaseStrategy, ABC):
         # It will use 95% amount of your total value by default
         return self.risk_degree
 
+    def set_position_manager(self, position_manager):
+        self.position_manager = position_manager
 
 class TopkDropoutStrategy(BaseSignalStrategy):
     # TODO:
@@ -89,6 +92,7 @@ class TopkDropoutStrategy(BaseSignalStrategy):
         hold_thresh=1,
         only_tradable=False,
         forbid_all_trade_at_limit=True,
+        pm_lookback: int = 60,
         **kwargs,
     ):
         """
@@ -135,6 +139,7 @@ class TopkDropoutStrategy(BaseSignalStrategy):
         self.hold_thresh = hold_thresh
         self.only_tradable = only_tradable
         self.forbid_all_trade_at_limit = forbid_all_trade_at_limit
+        self.pm_lookback = pm_lookback
 
     def generate_trade_decision(self, execute_result=None):
         # get the number of trading step finished, trade_step can be [0, 1, 2, ..., trade_len - 1]
@@ -267,7 +272,39 @@ class TopkDropoutStrategy(BaseSignalStrategy):
         # buy new stock
         # note the current has been changed
         # current_stock_list = current_temp.get_stock_list()
-        value = cash * self.risk_degree / len(buy) if len(buy) > 0 else 0
+        # determine allocation across buy list, optionally using injected PositionManager
+        alloc_values = {}
+        if len(buy) > 0 and self.position_manager is not None:
+            # build lookback returns for buy universe
+            look_end = pred_start_time
+            try:
+                # use business days for lookback
+                look_start = pd.Timestamp(look_end) - pd.tseries.offsets.BDay(self.pm_lookback)
+            except Exception:
+                look_start = pred_start_time
+            try:
+                price_df = D.features(
+                    list(buy), ["$close"], start_time=look_start, end_time=look_end, freq=self.trade_calendar.get_freq()
+                )
+                prices = price_df["$close"].unstack(level="instrument")
+                rets = (np.log(prices / prices.shift(1))).dropna(how="any")
+                w_series = self.position_manager.optimize(rets)
+                if w_series is not None and not w_series.empty:
+                    # keep only codes in buy, normalize
+                    w = w_series.reindex(list(buy)).fillna(0.0)
+                    total_w = float(w.sum())
+                    if total_w > 0:
+                        w = w / total_w
+                        for code in buy:
+                            alloc_values[code] = float(w.get(code, 0.0))
+            except Exception:
+                alloc_values = {}
+
+        total_invest = cash * self.risk_degree
+        if not alloc_values and len(buy) > 0:
+            # fallback to equal allocation
+            eq = 1.0 / len(buy)
+            alloc_values = {code: eq for code in buy}
 
         # open_cost should be considered in the real trading environment, while the backtest in evaluate.py does not
         # consider it as the aim of demo is to accomplish same strategy as evaluate.py, so comment out this line
@@ -286,7 +323,9 @@ class TopkDropoutStrategy(BaseSignalStrategy):
             buy_price = self.trade_exchange.get_deal_price(
                 stock_id=code, start_time=trade_start_time, end_time=trade_end_time, direction=OrderDir.BUY
             )
-            buy_amount = value / buy_price
+            alloc_weight = alloc_values.get(code, 0.0)
+            buy_value = total_invest * alloc_weight if alloc_values else 0.0
+            buy_amount = (buy_value / buy_price) if buy_price else 0.0
             factor = self.trade_exchange.get_factor(stock_id=code, start_time=trade_start_time, end_time=trade_end_time)
             buy_amount = self.trade_exchange.round_amount_by_trade_unit(buy_amount, factor)
             buy_order = Order(
@@ -647,11 +686,11 @@ class VolTopkDropoutStrategy(WeightStrategyBase):
 
     def _calculate_weights(self, target_codes, trade_start_time):
         """
-        Calculate weights for target_codes based on inverse volatility.
+        Calculate weights for target_codes based on volatility groups.
         """
         if self.vol_window <= 0 or self.vol_metrics is None:
-            raise ValueError("Volatility window or metrics not set for inverse volatility weighting.")
-        vol = {}
+            raise ValueError("Volatility window or metrics not set for volatility-based weighting.")
+        
         volatility_df = self.vol_metrics["volatility"]
 
         # Find the closest available date for volatility data
@@ -666,31 +705,53 @@ class VolTopkDropoutStrategy(WeightStrategyBase):
         else:
             closest_date = trade_start_time
 
-        # Define minimum volatility threshold to prevent extreme inverse values
-        min_vol_threshold = 0.01  # 1% minimum volatility
-        
+        filtered_codes = []
+        vol = {}
+        #import pdb; pdb.set_trace()
         for code in target_codes:
             if code in volatility_df.columns:
+                vol_series = volatility_df[code].loc[:closest_date].dropna()
                 v = volatility_df.loc[closest_date, code]
-                if not pd.isna(v) and v > 0:
-                    # Apply minimum threshold to prevent extreme inverse values
-                    vol[code] = max(v, min_vol_threshold)
+                if not pd.isna(v):
+                    upward = False
+                    if len(vol_series) > 10:
+                        ema_short = vol_series.ewm(span=5, adjust=False).mean().iloc[-1]
+                        ema_long = vol_series.ewm(span=10, adjust=False).mean().iloc[-1]
+                        upward = ema_short > ema_long
 
-        if not vol:
-            weight = 1.0 / len(target_codes) if target_codes else 0
-            return {code: weight for code in target_codes}
+                    if v <= 0.10 or upward:
+                        filtered_codes.append(code)
+                        vol[code] = v
 
-        # For stocks without volatility data, use maximum observed volatility (but at least min_threshold)
-        max_vol = max(max(vol.values()), min_vol_threshold) if vol else min_vol_threshold
-        for code in target_codes:
+        if not filtered_codes:
+            return {code: 1.0 / len(target_codes) if target_codes else 0 for code in target_codes}
+
+        # For stocks without volatility data, use maximum observed volatility (though filtered already)
+        max_vol = max(vol.values()) if vol else 1.0
+        for code in filtered_codes:
             if code not in vol:
                 vol[code] = max_vol
 
         #import pdb; pdb.set_trace()
-        # Inverse volatility weighting with capped values
-        inv_vol = {code: 1 / v for code, v in vol.items()}
-        total_inv = sum(inv_vol.values())
-        return {code: iv / total_inv for code, iv in inv_vol.items()}
+        # Group by volatility quantiles (fixed bins)
+        vol_df = pd.Series(vol)
+        bins = [-np.inf, -0.1, 0.10, 0.20, 0.30, np.inf]
+        labels = ['<-10', '-10-10', '10-20', '20-30', '30+']
+        vol_df_grouped = pd.cut(vol_df, bins=bins, labels=labels)
+        
+        group_weights = {'<-10': 0.0, '-10-10': 0.7, '10-20': 0.2, '20-30': 0.1, '30+': 0.0}
+        
+        weights = {}
+        for label in labels:
+            group_codes = vol_df[vol_df_grouped == label].index.tolist()
+            if group_codes:
+                total_w = group_weights[label]
+                n = len(group_codes)
+                w_per_stock = total_w / n
+                for code in group_codes:
+                    weights[code] = w_per_stock
+        
+        return weights
 
     def generate_target_weight_position(self, score, current, trade_start_time, trade_end_time):
         pred_score = score

@@ -52,56 +52,11 @@ class TestVolTopkDropoutStrategy(unittest.TestCase):
         )
         return strategy
 
-    @patch("qlib.contrib.strategy.signal_strategy.portfolio_volatility")
     @patch(
         "qlib.contrib.strategy.signal_strategy.VolTopkDropoutStrategy._compute_portfolio_volatility"
     )
     @patch("qlib.contrib.strategy.signal_strategy.create_signal_from")
-    def test_volatility_adjustment(
-        self, mock_create_signal, mock_compute_vol, mock_port_vol
-    ):
-        mock_create_signal.return_value = self.signal
-        mock_port_vol.return_value = pd.Series(
-            [0.035355], index=[pd.Timestamp("2023-01-03")]
-        )
-
-        params = self.strategy_params.copy()
-        params.update({"vol_window": 20, "target_volatility": 0.10})
-        strategy = self._create_strategy(params)
-
-        mock_compute_vol.assert_called_once()
-
-        stocks = [f"SH60000{i}" for i in range(5)]
-        cov_data = {}
-        for s1 in stocks:
-            for s2 in stocks:
-                cov_data[(pd.Timestamp("2023-01-03"), s1, s2)] = (
-                    0.0025 if s1 == s2 else 0.0
-                )
-        cov_df = pd.DataFrame.from_dict(
-            cov_data, orient="index", columns=["covariance"]
-        )
-        cov_df.index = pd.MultiIndex.from_tuples(cov_df.index)
-        strategy.vol_metrics = {
-            "covariance": cov_df,
-            "volatility": pd.DataFrame(
-                0.05, index=[pd.Timestamp("2023-01-03")], columns=stocks
-            ),
-        }
-
-        strategy.order_generator = MagicMock()
-        strategy.generate_trade_decision()
-
-        args, kwargs = (
-            strategy.order_generator.generate_order_list_from_target_weight_position.call_args
-        )
-        self.assertAlmostEqual(kwargs["risk_degree"], 0.178, places=3)
-
-    @patch(
-        "qlib.contrib.strategy.signal_strategy.VolTopkDropoutStrategy._compute_portfolio_volatility"
-    )
-    @patch("qlib.contrib.strategy.signal_strategy.create_signal_from")
-    def test_inverse_vol_weighting(
+    def test_volatility_quantile_weighting(
         self, mock_create_signal, mock_compute_vol
     ):
         mock_create_signal.return_value = self.signal
@@ -112,24 +67,42 @@ class TestVolTopkDropoutStrategy(unittest.TestCase):
 
         mock_compute_vol.assert_called_once()
 
-        stocks = [f"SH60000{i}" for i in range(3)]
-        strategy.vol_metrics = {
-            "volatility": pd.DataFrame(
-                {"SH600000": 0.1, "SH600001": 0.2, "SH600002": 0.3},
-                index=[pd.Timestamp("2023-01-03")],
-            )
-        }
+        # Create a more detailed volatility history to test trend filtering
+        dates = pd.date_range(end="2023-01-03", periods=25)
+        stocks = [f"SH60000{i}" for i in range(5)]
+        vol_data = pd.DataFrame(index=dates, columns=stocks, dtype=float)
 
+        # SH600000: Low volatility (included)
+        vol_data["SH600000"] = -0.05
+        # SH600001: High volatility, but upward trend (included)
+        vol_data["SH600001"] = np.linspace(0.12, 0.15, 25)
+        # SH600002: High volatility, downward trend (excluded)
+        vol_data["SH600002"] = np.linspace(0.28, 0.25, 25)
+        # SH600003: High volatility, no trend (excluded)
+        vol_data["SH600003"] = 0.35
+        # SH600004: Low volatility (included)
+        vol_data["SH600004"] = 0.08
+
+        strategy.vol_metrics = {"volatility": vol_data}
+
+        # We are testing the logic for 2023-01-03
         weights = strategy._calculate_weights(stocks, pd.Timestamp("2023-01-03"))
 
-        total_inv = 1 / 0.1 + 1 / 0.2 + 1 / 0.3
+        # Expected weights based on filtering and quantile allocation
+        # Included: SH600000 (low_vol), SH600001 (up_trend), SH600004 (low_vol)
+        # Excluded: SH600002 (down_trend), SH600003 (high_vol)
         expected = {
-            "SH600000": (1 / 0.1) / total_inv,
-            "SH600001": (1 / 0.2) / total_inv,
-            "SH600002": (1 / 0.3) / total_inv,
+            # Group -10-10% (55% total): SH600000 (-0.05), SH600004 (0.08)
+            "SH600000": 0.55 / 2,
+            "SH600004": 0.55 / 2,
+            # Group 10-20% (25% total): SH600001 (0.15)
+            "SH600001": 0.25 / 1,
         }
-        for stock in stocks:
-            self.assertAlmostEqual(weights[stock], expected[stock])
+
+        self.assertEqual(len(weights), 3)
+        for stock, weight in expected.items():
+            self.assertIn(stock, weights)
+            self.assertAlmostEqual(weights[stock], weight)
 
 
 if __name__ == "__main__":

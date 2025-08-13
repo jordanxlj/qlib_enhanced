@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from ..strategy.base import BaseStrategy
     from .executor import BaseExecutor
     from .decision import BaseTradeDecision
+    from ..contrib.strategy.position_manager import BasePositionManager
 
 from ..config import C
 from ..log import get_module_logger
@@ -177,6 +178,7 @@ def create_account_instance(
 def get_strategy_executor(
     start_time: Union[pd.Timestamp, str],
     end_time: Union[pd.Timestamp, str],
+    position: Union[str, dict, object, Path],
     strategy: Union[str, dict, object, Path],
     executor: Union[str, dict, object, Path],
     benchmark: Optional[str] = "SH000300",
@@ -189,6 +191,7 @@ def get_strategy_executor(
     # - typing annotations is not reliable
     from ..strategy.base import BaseStrategy  # pylint: disable=C0415
     from .executor import BaseExecutor  # pylint: disable=C0415
+    from ..contrib.strategy.position_manager import BasePositionManager  # pylint: disable=C0415
 
     trade_account = create_account_instance(
         start_time=start_time,
@@ -206,8 +209,10 @@ def get_strategy_executor(
     trade_exchange = get_exchange(**exchange_kwargs)
 
     common_infra = CommonInfrastructure(trade_account=trade_account, trade_exchange=trade_exchange)
+    trade_position = init_instance_by_config(position, accept_types=BasePositionManager) if position else None
     trade_strategy = init_instance_by_config(strategy, accept_types=BaseStrategy)
     trade_strategy.reset_common_infra(common_infra)
+    trade_strategy.set_position_manager(trade_position)
     trade_executor = init_instance_by_config(executor, accept_types=BaseExecutor)
     trade_executor.reset_common_infra(common_infra)
 
@@ -217,6 +222,7 @@ def get_strategy_executor(
 def backtest(
     start_time: Union[pd.Timestamp, str],
     end_time: Union[pd.Timestamp, str],
+    position: Union[str, dict, object, Path],
     strategy: Union[str, dict, object, Path],
     executor: Union[str, dict, object, Path],
     benchmark: str = "SH000300",
@@ -236,6 +242,9 @@ def backtest(
         closed end time for backtest
         **NOTE**: This will be applied to the outmost executor's calendar.
         E.g. Executor[day](Executor[1min]),   setting `end_time == 20XX0301` will include all the minutes on 20XX0301
+    position : Union[str, dict, object, Path]
+        for initializing outermost portfolio position manager. Please refer to the docs of init_instance_by_config for more
+        information.
     strategy : Union[str, dict, object, Path]
         for initializing outermost portfolio strategy. Please refer to the docs of init_instance_by_config for more
         information.
@@ -266,6 +275,7 @@ def backtest(
     trade_strategy, trade_executor = get_strategy_executor(
         start_time,
         end_time,
+        position,
         strategy,
         executor,
         benchmark,
