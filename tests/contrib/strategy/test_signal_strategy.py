@@ -8,7 +8,8 @@ from unittest.mock import MagicMock, patch
 
 from qlib.backtest.position import Position
 from qlib.backtest.exchange import Exchange
-from qlib.contrib.strategy.signal_strategy import VolTopkDropoutStrategy
+from qlib.contrib.strategy.signal_strategy import VolTopkDropoutStrategy, OptimizedTopkDropoutStrategy
+from qlib.backtest.decision import Order
 
 class TestVolTopkDropoutStrategy(unittest.TestCase):
     def setUp(self):
@@ -103,6 +104,181 @@ class TestVolTopkDropoutStrategy(unittest.TestCase):
         for stock, weight in expected.items():
             self.assertIn(stock, weights)
             self.assertAlmostEqual(weights[stock], weight)
+
+
+class TestOptimizedTopkDropoutStrategy(unittest.TestCase):
+    def setUp(self):
+        self.trade_calendar = MagicMock()
+        self.trade_calendar.get_trade_step.return_value = 0
+        self.trade_calendar.get_trade_len.return_value = 10
+
+        def get_step_time_mock(*args, **kwargs):
+            if kwargs.get("shift") == 1:
+                return (pd.Timestamp("2023-01-02"), pd.Timestamp("2023-01-03"))
+            else:
+                return (pd.Timestamp("2023-01-03"), pd.Timestamp("2023-01-04"))
+
+        self.trade_calendar.get_step_time.side_effect = get_step_time_mock
+
+        self.trade_exchange = MagicMock(spec=Exchange)
+        self.trade_exchange.is_stock_tradable.return_value = True
+        # default deal price and factor
+        self.trade_exchange.get_deal_price.return_value = 10.0
+        self.trade_exchange.get_factor.return_value = 1.0
+        self.trade_exchange.check_order.return_value = True
+
+        def deal_order_side_effect(order, position):
+            price = 10.0
+            trade_val = order.amount * price
+            cost = 0.0
+            return trade_val, cost, price
+
+        self.trade_exchange.deal_order.side_effect = deal_order_side_effect
+
+        self.signal = MagicMock()
+        # simple increasing scores; will prefer buying new ones
+        self.signal.get_signal.return_value = pd.Series(
+            [0.1, 0.2, 0.3, 0.4, 0.5], index=["AAA", "BBB", "CCC", "DDD", "EEE"], name="score"
+        )
+
+        # Start with one holding 'AAA' 50 shares @ 10, cash 500
+        self.start_pos = Position(cash=500.0, position_dict={"AAA": {"amount": 50, "price": 10.0}})
+        trade_account = MagicMock()
+        trade_account.current_position = self.start_pos
+        self.common_infra = {"trade_account": trade_account}
+
+        self.strategy_params = {
+            "topk": 2,
+            "n_drop": 1,
+            "risk_degree": 1.0,
+            "trade_exchange": self.trade_exchange,
+            "pm_lookback": 10,
+        }
+
+    def _make_strategy(self, position_manager=None):
+        strategy = OptimizedTopkDropoutStrategy(signal=self.signal, **self.strategy_params)
+        if position_manager is not None:
+            strategy.set_position_manager(position_manager)
+        strategy.reset(
+            level_infra={"trade_calendar": self.trade_calendar},
+            common_infra=self.common_infra,
+        )
+        return strategy
+
+    @patch("qlib.contrib.strategy.signal_strategy.create_signal_from")
+    def test_rebalance_with_position_manager(self, mock_create_signal):
+        mock_create_signal.return_value = self.signal
+
+        # Price cache for returns
+        dates = pd.date_range("2022-12-20", periods=12, freq="B")
+        prices = pd.DataFrame(
+            {
+                "AAA": 10 + np.arange(len(dates)) * 0,  # flat
+                "BBB": 10 + np.arange(len(dates)) * 0.1,
+                "CCC": 10 + np.arange(len(dates)) * 0.05,
+            },
+            index=dates,
+        )
+
+        pm = MagicMock()
+        # Optimizer wants 30% AAA, 70% BBB across union holdings+buy candidates
+        pm.optimize.return_value = pd.Series({"AAA": 0.3, "BBB": 0.7, "CCC": 0.0})
+
+        strategy = self._make_strategy(position_manager=pm)
+        strategy._pm_price_cache = prices
+
+        decision = strategy.generate_trade_decision()
+        orders = decision.get_decision()
+        # Expect one partial sell of AAA (reduce from ~$500 to $300), and one buy of BBB (~$700)
+        sell_orders = [o for o in orders if o.direction == Order.SELL]
+        buy_orders = [o for o in orders if o.direction == Order.BUY]
+
+        self.assertGreaterEqual(len(sell_orders), 1)
+        self.assertGreaterEqual(len(buy_orders), 1)
+
+        # Check approximate amounts given price 10
+        total_value = 500.0 + 500.0  # stock value + cash
+        target_aaa_val = 0.3 * total_value
+        need_sell_val = max(0.0, 500.0 - target_aaa_val)
+        # aggregate sell amounts for AAA
+        sold_units = sum(o.amount for o in sell_orders if o.stock_id == "AAA")
+        self.assertAlmostEqual(sold_units * 10.0, need_sell_val, delta=1e-6)
+
+    @patch("qlib.contrib.strategy.signal_strategy.create_signal_from")
+    def test_fallback_without_position_manager_equal_weight(self, mock_create_signal):
+        mock_create_signal.return_value = self.signal
+
+        strategy = self._make_strategy(position_manager=None)
+        # No price cache needed since PM not used; should equal weight across union
+        decision = strategy.generate_trade_decision()
+        orders = decision.get_decision()
+        self.assertTrue(any(o.direction == Order.BUY for o in orders))
+
+    @patch("qlib.contrib.strategy.signal_strategy.create_signal_from")
+    def test_returns_with_missing_data_cleaning(self, mock_create_signal):
+        mock_create_signal.return_value = self.signal
+
+        # Create returns with many NaNs so only certain columns have sufficient observations
+        dates = pd.date_range("2022-12-20", periods=12, freq="B")
+        prices = pd.DataFrame(index=dates, columns=["AAA", "BBB", "CCC"], dtype=float)
+        prices["AAA"] = 10.0  # constant available
+        prices["BBB"] = np.where(np.arange(len(dates)) % 2 == 0, 10.0 + np.arange(len(dates)) * 0.1, np.nan)
+        prices["CCC"] = np.nan  # all NaN -> should be dropped
+
+        captured_returns = {}
+
+        def pm_optimize_capture(returns_df):
+            captured_returns["cols"] = list(returns_df.columns)
+            # return equal weights for provided
+            return pd.Series(1.0 / len(returns_df.columns), index=returns_df.columns)
+
+        pm = MagicMock()
+        pm.optimize.side_effect = pm_optimize_capture
+
+        strategy = self._make_strategy(position_manager=pm)
+        strategy._pm_price_cache = prices
+
+        strategy.generate_trade_decision()
+
+        # Expect 'AAA' and possibly 'BBB' (depending on min_obs) but not 'CCC'
+        self.assertIn("AAA", captured_returns.get("cols", []))
+        self.assertNotIn("CCC", captured_returns.get("cols", []))
+
+    @patch("qlib.contrib.strategy.signal_strategy.create_signal_from")
+    def test_not_tradable_skips_orders_and_cash_scaling(self, mock_create_signal):
+        mock_create_signal.return_value = self.signal
+
+        # Make only buys tradable for BBB; and set cash small to enforce scaling
+        def is_tradable(stock_id, start_time, end_time, direction=None):
+            if direction == Order.SELL and stock_id == "AAA":
+                return True
+            if direction == Order.BUY and stock_id == "BBB":
+                return True
+            return False
+
+        self.trade_exchange.is_stock_tradable.side_effect = is_tradable
+        # Reduce starting cash to force scaling
+        self.start_pos.position["cash"] = 50.0
+
+        dates = pd.date_range("2022-12-20", periods=12, freq="B")
+        prices = pd.DataFrame({"AAA": 10.0, "BBB": 10.0}, index=dates)
+
+        pm = MagicMock()
+        pm.optimize.return_value = pd.Series({"AAA": 0.2, "BBB": 0.8})
+
+        strategy = self._make_strategy(position_manager=pm)
+        strategy._pm_price_cache = prices
+
+        decision = strategy.generate_trade_decision()
+        orders = decision.get_decision()
+
+        # Only one buy for BBB and possibly one sell for AAA
+        buy_orders = [o for o in orders if o.direction == Order.BUY]
+        sell_orders = [o for o in orders if o.direction == Order.SELL]
+        self.assertTrue(all(o.stock_id == "BBB" for o in buy_orders))
+        # Verify buy not exceeding available cash (50)
+        total_buy_val = sum(o.amount * 10.0 for o in buy_orders)
+        self.assertLessEqual(total_buy_val, 50.0 + 1e-6)
 
 
 if __name__ == "__main__":
