@@ -1101,8 +1101,11 @@ class OptimizedTopkDropoutStrategy(BaseSignalStrategy):
                     stock_id=code, start_time=trade_start_time, end_time=trade_end_time, direction=OrderDir.SELL
                 )
                 if sell_price and sell_price > 0:
-                    sell_value = min(current_val - target_val, current_val)
-                    sell_amount = float(sell_value / sell_price)
+                    # compute in shares to avoid price-mismatch oversell
+                    target_shares_at_sell_price = target_val / sell_price
+                    sell_amount = max(0.0, float(current_amount - target_shares_at_sell_price))
+                    # do not exceed current holdings due to numeric noise
+                    sell_amount = min(sell_amount, float(current_amount))
                     if sell_amount > 0:
                         sell_order = Order(
                             stock_id=code,

@@ -280,6 +280,69 @@ class TestOptimizedTopkDropoutStrategy(unittest.TestCase):
         total_buy_val = sum(o.amount * 10.0 for o in buy_orders)
         self.assertLessEqual(total_buy_val, 50.0 + 1e-6)
 
+    @patch("qlib.contrib.strategy.signal_strategy.create_signal_from")
+    def test_partial_sell_uses_sell_price_and_no_oversell(self, mock_create_signal):
+        mock_create_signal.return_value = self.signal
+
+        # Start with only AAA holding: 500 shares at stored price 10.0, no cash
+        self.start_pos.position["AAA"]["amount"] = 500.0
+        self.start_pos.position["AAA"]["price"] = 10.0
+        self.start_pos.position["cash"] = 0.0
+
+        # Exchange sell price differs from stored price to simulate mismatch
+        def get_deal_price_side(stock_id, start_time, end_time, direction):
+            if direction == Order.SELL:
+                return 10.05  # slightly different from stored 10.0
+            return 10.0
+
+        self.trade_exchange.get_deal_price.side_effect = get_deal_price_side
+        self.trade_exchange.get_factor.return_value = 1.0
+        self.trade_exchange.check_order.return_value = True
+
+        def deal_order_side_effect(order, position):
+            price = get_deal_price_side(order.stock_id, None, None, order.direction)
+            trade_val = order.amount * price
+            return trade_val, 0.0, price
+
+        self.trade_exchange.deal_order.side_effect = deal_order_side_effect
+
+        # PM targets 30% AAA, 70% BBB to force a sell in AAA
+        pm = MagicMock()
+        pm.optimize.return_value = pd.Series({"AAA": 0.3, "BBB": 0.7})
+
+        # Provide price cache for AAA/BBB so PM universe includes both
+        dates = pd.date_range("2022-12-20", periods=12, freq="B")
+        prices = pd.DataFrame({"AAA": 10.0, "BBB": 10.0}, index=dates)
+
+        strategy = self._make_strategy(position_manager=pm)
+        strategy._pm_price_cache = prices
+
+        # Prevent buys (BBB) from executing to isolate sell sizing behavior
+        def is_tradable(stock_id, start_time, end_time, direction=None):
+            if direction == Order.BUY:
+                return False
+            return True
+
+        self.trade_exchange.is_stock_tradable.side_effect = is_tradable
+
+        decision = strategy.generate_trade_decision()
+        orders = decision.get_decision()
+
+        sell_orders = [o for o in orders if o.direction == Order.SELL and o.stock_id == "AAA"]
+        self.assertGreaterEqual(len(sell_orders), 1)
+
+        # Compute expected sell shares using sell price to avoid oversell
+        total_value = 500.0 * 10.0  # no cash
+        target_val = 0.3 * total_value
+        sell_price = 10.05
+        expected_sell_shares = 500.0 - (target_val / sell_price)
+
+        sold_units = sum(o.amount for o in sell_orders)
+        # No oversell
+        self.assertLessEqual(sold_units, 500.0 + 1e-9)
+        # Close to expected computed with sell price
+        self.assertAlmostEqual(sold_units, expected_sell_shares, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

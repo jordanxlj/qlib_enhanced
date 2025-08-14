@@ -117,16 +117,75 @@ class RiskfolioPositionManager(BasePositionManager):
             "hist": True,
         }, **self.default_params, **(params or {})}
 
-        # Clean returns: drop columns with all-NaN and rows with any NaN
-        clean = returns.dropna(axis=1, how="all").dropna(axis=0, how="any")
+        # Clean returns more permissively:
+        # - drop columns with all-NaN
+        # - drop rows with all-NaN
+        # - remove assets with too few observations
+        # - fill remaining NaNs with 0 to allow optimization
+        clean = returns.dropna(axis=1, how="all").dropna(axis=0, how="all")
+        if clean.empty:
+            return pd.Series(dtype=float)
+
+        min_obs = max(3, int(len(clean.index) * 0.3))
+        counts = clean.count()
+        keep_cols = counts[counts >= min_obs].index
+        clean = clean.loc[:, keep_cols]
+        if clean.shape[1] == 0:
+            return pd.Series(dtype=float)
+
+        clean = clean.fillna(0.0)
         if clean.empty or clean.shape[1] == 0:
             return pd.Series(dtype=float)
 
         port = rp.Portfolio(returns=clean)
-        port.assets_stats(
-            method_mu=cfg["method_mu"],
-            method_cov=cfg["method_cov"],
-        )
+
+        # Compute mu and cov ourselves to avoid repeated PD warnings from riskfolio
+        # and to apply a robust PD-fix before optimization
+        # Mean vector
+        if cfg["method_mu"] == "hist":
+            mu = clean.mean()
+        elif cfg["method_mu"] == "ewma":
+            decay = float(cfg.get("d", 0.94))
+            weights = np.array([decay ** (len(clean) - 1 - i) for i in range(len(clean))], dtype=float)
+            weights = weights / weights.sum()
+            mu = pd.Series((clean.values * weights[:, None]).sum(axis=0), index=clean.columns)
+        else:
+            # fallback to simple mean
+            mu = clean.mean()
+
+        # Covariance matrix
+        if cfg["method_cov"] == "ewma":
+            decay = float(cfg.get("d", 0.94))
+            x = clean.values - mu.values
+            S = np.zeros((x.shape[1], x.shape[1]), dtype=float)
+            w = 1.0
+            norm = 0.0
+            for t in range(x.shape[0] - 1, -1, -1):
+                xt = x[t : t + 1].T
+                S = decay * S + (1 - decay) * (xt @ xt.T)
+                w *= decay
+                norm = decay * norm + (1 - decay)
+            if norm > 0:
+                S = S / norm
+            cov = pd.DataFrame(S, index=clean.columns, columns=clean.columns)
+        else:
+            cov = clean.cov()
+
+        # Ensure symmetry
+        cov = (cov + cov.T) * 0.5
+
+        # Make covariance positive definite via diagonal loading if needed
+        eps = 1e-6
+        try:
+            min_eig = float(np.linalg.eigvalsh(cov.values).min())
+        except Exception:
+            min_eig = -1.0
+        if min_eig < eps:
+            jitter = (eps - min_eig) + 1e-8
+            cov.values[range(cov.shape[0]), range(cov.shape[1])] += jitter
+
+        port.mu = mu
+        port.cov = cov
 
         w = port.optimization(
             model=cfg["model"],
@@ -145,8 +204,9 @@ class RiskfolioPositionManager(BasePositionManager):
 
         # Clean numerical noise, enforce non-negativity if short=False
         w = w.fillna(0.0).astype(float)
-        if not cfg["short"]:
-            w = w.clip(lower=0.0)
+        # no short
+        w = w.clip(lower=0.0)
+
         total = float(np.abs(w).sum())
         if total > 0:
             w = w / total
