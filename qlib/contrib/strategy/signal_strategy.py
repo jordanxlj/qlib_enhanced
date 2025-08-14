@@ -139,7 +139,6 @@ class TopkDropoutStrategy(BaseSignalStrategy):
         self.hold_thresh = hold_thresh
         self.only_tradable = only_tradable
         self.forbid_all_trade_at_limit = forbid_all_trade_at_limit
-        self.pm_lookback = pm_lookback
 
     def generate_trade_decision(self, execute_result=None):
         # get the number of trading step finished, trade_step can be [0, 1, 2, ..., trade_len - 1]
@@ -272,39 +271,7 @@ class TopkDropoutStrategy(BaseSignalStrategy):
         # buy new stock
         # note the current has been changed
         # current_stock_list = current_temp.get_stock_list()
-        # determine allocation across buy list, optionally using injected PositionManager
-        alloc_values = {}
-        if len(buy) > 0 and self.position_manager is not None:
-            # build lookback returns for buy universe
-            look_end = pred_start_time
-            try:
-                # use business days for lookback
-                look_start = pd.Timestamp(look_end) - pd.tseries.offsets.BDay(self.pm_lookback)
-            except Exception:
-                look_start = pred_start_time
-            try:
-                price_df = D.features(
-                    list(buy), ["$close"], start_time=look_start, end_time=look_end, freq=self.trade_calendar.get_freq()
-                )
-                prices = price_df["$close"].unstack(level="instrument")
-                rets = (np.log(prices / prices.shift(1))).dropna(how="any")
-                w_series = self.position_manager.optimize(rets)
-                if w_series is not None and not w_series.empty:
-                    # keep only codes in buy, normalize
-                    w = w_series.reindex(list(buy)).fillna(0.0)
-                    total_w = float(w.sum())
-                    if total_w > 0:
-                        w = w / total_w
-                        for code in buy:
-                            alloc_values[code] = float(w.get(code, 0.0))
-            except Exception:
-                alloc_values = {}
-
-        total_invest = cash * self.risk_degree
-        if not alloc_values and len(buy) > 0:
-            # fallback to equal allocation
-            eq = 1.0 / len(buy)
-            alloc_values = {code: eq for code in buy}
+        value = cash * self.risk_degree / len(buy) if len(buy) > 0 else 0
 
         # open_cost should be considered in the real trading environment, while the backtest in evaluate.py does not
         # consider it as the aim of demo is to accomplish same strategy as evaluate.py, so comment out this line
@@ -323,9 +290,7 @@ class TopkDropoutStrategy(BaseSignalStrategy):
             buy_price = self.trade_exchange.get_deal_price(
                 stock_id=code, start_time=trade_start_time, end_time=trade_end_time, direction=OrderDir.BUY
             )
-            alloc_weight = alloc_values.get(code, 0.0)
-            buy_value = total_invest * alloc_weight if alloc_values else 0.0
-            buy_amount = (buy_value / buy_price) if buy_price else 0.0
+            buy_amount = value / buy_price
             factor = self.trade_exchange.get_factor(stock_id=code, start_time=trade_start_time, end_time=trade_end_time)
             buy_amount = self.trade_exchange.round_amount_by_trade_unit(buy_amount, factor)
             buy_order = Order(
@@ -834,3 +799,300 @@ class VolTopkDropoutStrategy(WeightStrategyBase):
         target_codes = list(set(last).difference(sell).union(buy))
 
         return self._calculate_weights(target_codes, trade_start_time)
+
+class OptimizedTopkDropoutStrategy(BaseSignalStrategy):
+    # TODO:
+    # 1. Supporting leverage the get_range_limit result from the decision
+    # 2. Supporting alter_outer_trade_decision
+    # 3. Supporting checking the availability of trade decision
+    # 4. Regenerate results with forbid_all_trade_at_limit set to false and flip the default to false, as it is consistent with reality.
+    def __init__(
+            self,
+            *,
+            topk,
+            n_drop,
+            method_sell="bottom",
+            method_buy="top",
+            hold_thresh=1,
+            only_tradable=False,
+            forbid_all_trade_at_limit=True,
+            pm_lookback: int = 60,
+            **kwargs,
+    ):
+        """
+        Parameters
+        -----------
+        topk : int
+            the number of stocks in the portfolio.
+        n_drop : int
+            number of stocks to be replaced in each trading date.
+        method_sell : str
+            dropout method_sell, random/bottom.
+        method_buy : str
+            dropout method_buy, random/top.
+        hold_thresh : int
+            minimum holding days
+            before sell stock , will check current.get_stock_count(order.stock_id) >= self.hold_thresh.
+        only_tradable : bool
+            will the strategy only consider the tradable stock when buying and selling.
+
+            if only_tradable:
+
+                strategy will make decision with the tradable state of the stock info and avoid buy and sell them.
+
+            else:
+
+                strategy will make buy sell decision without checking the tradable state of the stock.
+        forbid_all_trade_at_limit : bool
+            if forbid all trades when limit_up or limit_down reached.
+
+            if forbid_all_trade_at_limit:
+
+                strategy will not do any trade when price reaches limit up/down, even not sell at limit up nor buy at
+                limit down, though allowed in reality.
+
+            else:
+
+                strategy will sell at limit up and buy ad limit down.
+        """
+        super().__init__(**kwargs)
+        self.topk = topk
+        self.n_drop = n_drop
+        self.method_sell = method_sell
+        self.method_buy = method_buy
+        self.hold_thresh = hold_thresh
+        self.only_tradable = only_tradable
+        self.forbid_all_trade_at_limit = forbid_all_trade_at_limit
+        self.pm_lookback = pm_lookback
+        # cache for price data used by position manager optimization
+        self._pm_price_cache = None  # type: Optional[pd.DataFrame]
+
+    def reset_level_infra(self, level_infra):
+        """Preload price cache once, similar to VolTopkDropoutStrategy."""
+        super().reset_level_infra(level_infra)
+        try:
+            trade_len = self.trade_calendar.get_trade_len()
+            signal_start_time, _ = self.trade_calendar.get_step_time(trade_step=0, shift=1)
+            _, signal_end_time = self.trade_calendar.get_step_time(trade_step=trade_len - 1, shift=1)
+
+            # Determine the universe by scanning signals over the whole period
+            instruments = D.instruments("csi300")
+            import pdb; pdb.set_trace()
+
+            # Add lookback buffer at the start so returns can be computed
+            s_buf = pd.Timestamp(signal_start_time) - pd.tseries.offsets.BDay(self.pm_lookback)
+            freq = self.trade_calendar.get_freq()
+            feat = D.features(instruments, ["$close"], start_time=s_buf, end_time=signal_end_time, freq=freq)
+            if feat is not None and not feat.empty:
+                self._pm_price_cache = feat["$close"].unstack(level="instrument").sort_index()
+        except Exception:
+            # Fallback: keep cache empty, later code will gracefully fallback
+            self._pm_price_cache = None
+
+    def generate_trade_decision(self, execute_result=None):
+        # get the number of trading step finished, trade_step can be [0, 1, 2, ..., trade_len - 1]
+        trade_step = self.trade_calendar.get_trade_step()
+        trade_start_time, trade_end_time = self.trade_calendar.get_step_time(trade_step)
+        pred_start_time, pred_end_time = self.trade_calendar.get_step_time(trade_step, shift=1)
+        pred_score = self.signal.get_signal(start_time=pred_start_time, end_time=pred_end_time)
+        # NOTE: the current version of topk dropout strategy can't handle pd.DataFrame(multiple signal)
+        # So it only leverage the first col of signal
+        if isinstance(pred_score, pd.DataFrame):
+            pred_score = pred_score.iloc[:, 0]
+        if pred_score is None:
+            return TradeDecisionWO([], self)
+        if self.only_tradable:
+            # If The strategy only consider tradable stock when make decision
+            # It needs following actions to filter stocks
+            def get_first_n(li, n, reverse=False):
+                cur_n = 0
+                res = []
+                for si in reversed(li) if reverse else li:
+                    if self.trade_exchange.is_stock_tradable(
+                            stock_id=si, start_time=trade_start_time, end_time=trade_end_time
+                    ):
+                        res.append(si)
+                        cur_n += 1
+                        if cur_n >= n:
+                            break
+                return res[::-1] if reverse else res
+
+            def get_last_n(li, n):
+                return get_first_n(li, n, reverse=True)
+
+            def filter_stock(li):
+                return [
+                    si
+                    for si in li
+                    if self.trade_exchange.is_stock_tradable(
+                        stock_id=si, start_time=trade_start_time, end_time=trade_end_time
+                    )
+                ]
+
+        else:
+            # Otherwise, the stock will make decision without the stock tradable info
+            def get_first_n(li, n):
+                return list(li)[:n]
+
+            def get_last_n(li, n):
+                return list(li)[-n:]
+
+            def filter_stock(li):
+                return li
+
+        current_temp: Position = copy.deepcopy(self.trade_position)
+        # generate order list for this adjust date
+        sell_order_list = []
+        buy_order_list = []
+        # load score
+        cash = current_temp.get_cash()
+        current_stock_list = current_temp.get_stock_list()
+
+        # last position (sorted by score)
+        last = pred_score.reindex(current_stock_list).sort_values(ascending=False).index
+        # The new stocks today want to buy **at most**
+        if self.method_buy == "top":
+            today = get_first_n(
+                pred_score[~pred_score.index.isin(last)].sort_values(ascending=False).index,
+                self.n_drop + self.topk - len(last),
+                )
+        elif self.method_buy == "random":
+            topk_candi = get_first_n(pred_score.sort_values(ascending=False).index, self.topk)
+            candi = list(filter(lambda x: x not in last, topk_candi))
+            n = self.n_drop + self.topk - len(last)
+            try:
+                today = np.random.choice(candi, n, replace=False)
+            except ValueError:
+                today = candi
+        else:
+            raise NotImplementedError(f"This type of input is not supported")
+        # combine(new stocks + last stocks),  we will drop stocks from this list
+        # In case of dropping higher score stock and buying lower score stock.
+        comb = pred_score.reindex(last.union(pd.Index(today))).sort_values(ascending=False).index
+
+        # Get the stock list we really want to sell (After filtering the case that we sell high and buy low)
+        if self.method_sell == "bottom":
+            sell = last[last.isin(get_last_n(comb, self.n_drop))]
+        elif self.method_sell == "random":
+            candi = filter_stock(last)
+            try:
+                sell = pd.Index(np.random.choice(candi, self.n_drop, replace=False) if len(last) else [])
+            except ValueError:  # No enough candidates
+                sell = candi
+        else:
+            raise NotImplementedError(f"This type of input is not supported")
+
+        # Get the stock list we really want to buy
+        buy = today[: len(sell) + self.topk - len(last)]
+        for code in current_stock_list:
+            if not self.trade_exchange.is_stock_tradable(
+                    stock_id=code,
+                    start_time=trade_start_time,
+                    end_time=trade_end_time,
+                    direction=None if self.forbid_all_trade_at_limit else OrderDir.SELL,
+            ):
+                print(f"stock_id: {code} is not tradable, skip it!")
+                continue
+            if code in sell:
+                # check hold limit
+                time_per_step = self.trade_calendar.get_freq()
+                if current_temp.get_stock_count(code, bar=time_per_step) < self.hold_thresh:
+                    continue
+                # sell order
+                sell_amount = current_temp.get_stock_amount(code=code)
+                # sell_amount = self.trade_exchange.round_amount_by_trade_unit(sell_amount, factor)
+                sell_order = Order(
+                    stock_id=code,
+                    amount=sell_amount,
+                    start_time=trade_start_time,
+                    end_time=trade_end_time,
+                    direction=Order.SELL,  # 0 for sell, 1 for buy
+                )
+                # is order executable
+                if self.trade_exchange.check_order(sell_order):
+                    sell_order_list.append(sell_order)
+                    trade_val, trade_cost, trade_price = self.trade_exchange.deal_order(
+                        sell_order, position=current_temp
+                    )
+                    # update cash
+                    cash += trade_val - trade_cost
+                    #print(f"sell order {code}, amount {sell_amount}, start {trade_start_time}, end {trade_end_time}, cash {cash}")
+        # buy new stock
+        # note the current has been changed
+        # current_stock_list = current_temp.get_stock_list()
+        # determine allocation across buy list, optionally using injected PositionManager
+        alloc_values = {}
+        if len(buy) > 0 and self.position_manager is not None:
+            # build lookback returns for buy universe
+            look_end = pred_start_time
+            try:
+                # use business days for lookback
+                look_start = pd.Timestamp(look_end) - pd.tseries.offsets.BDay(self.pm_lookback)
+            except Exception:
+                look_start = pred_start_time
+            try:
+                import pdb; pdb.set_trace()
+                prices = self._get_pm_close_prices(list(buy), look_start, look_end)
+                rets = (np.log(prices / prices.shift(1))).dropna(how="any")
+                w_series = self.position_manager.optimize(rets)
+                if w_series is not None and not w_series.empty:
+                    # keep only codes in buy, normalize
+                    w = w_series.reindex(list(buy)).fillna(0.0)
+                    total_w = float(w.sum())
+                    if total_w > 0:
+                        w = w / total_w
+                        for code in buy:
+                            alloc_values[code] = float(w.get(code, 0.0))
+            except Exception:
+                alloc_values = {}
+
+        total_invest = cash * self.risk_degree
+        if not alloc_values and len(buy) > 0:
+            # fallback to equal allocation
+            eq = 1.0 / len(buy)
+            alloc_values = {code: eq for code in buy}
+
+        # open_cost should be considered in the real trading environment, while the backtest in evaluate.py does not
+        # consider it as the aim of demo is to accomplish same strategy as evaluate.py, so comment out this line
+        # value = value / (1+self.trade_exchange.open_cost) # set open_cost limit
+        for code in buy:
+            # check is stock suspended
+            if not self.trade_exchange.is_stock_tradable(
+                    stock_id=code,
+                    start_time=trade_start_time,
+                    end_time=trade_end_time,
+                    direction=None if self.forbid_all_trade_at_limit else OrderDir.BUY,
+            ):
+                print(f"stock_id: {code} is not tradable, skip it!")
+                continue
+            # buy order
+            buy_price = self.trade_exchange.get_deal_price(
+                stock_id=code, start_time=trade_start_time, end_time=trade_end_time, direction=OrderDir.BUY
+            )
+            alloc_weight = alloc_values.get(code, 0.0)
+            buy_value = total_invest * alloc_weight if alloc_values else 0.0
+            buy_amount = (buy_value / buy_price) if buy_price else 0.0
+            factor = self.trade_exchange.get_factor(stock_id=code, start_time=trade_start_time, end_time=trade_end_time)
+            buy_amount = self.trade_exchange.round_amount_by_trade_unit(buy_amount, factor)
+            buy_order = Order(
+                stock_id=code,
+                amount=buy_amount,
+                start_time=trade_start_time,
+                end_time=trade_end_time,
+                direction=Order.BUY,  # 1 for buy
+            )
+            buy_order_list.append(buy_order)
+            #print(f"buy order {code}, amount {buy_amount}, start {trade_start_time}, end {trade_end_time}, value {value}")
+        return TradeDecisionWO(sell_order_list + buy_order_list, self)
+
+    def _get_pm_close_prices(self, instruments: list, start_time, end_time) -> pd.DataFrame:
+        """Return a wide DataFrame of $close prices by slicing the preloaded cache."""
+        if not instruments or self._pm_price_cache is None or self._pm_price_cache.empty:
+            return pd.DataFrame()
+        need_start = pd.Timestamp(start_time)
+        need_end = pd.Timestamp(end_time)
+        cols = [code for code in instruments if code in self._pm_price_cache.columns]
+        if not cols:
+            return pd.DataFrame()
+        result = self._pm_price_cache.loc[need_start:need_end, cols]
+        return result.sort_index().dropna(how="all")
