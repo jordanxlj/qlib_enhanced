@@ -1044,8 +1044,8 @@ class OptimizedTopkDropoutStrategy(BaseSignalStrategy):
                 # Prefer using all instruments present in the price cache intersected with signal universe
                 # so PM can suggest assets beyond simple 'today' picks (e.g., BBB in tests)
                 pm_universe = []
-                if self._pm_price_cache is not None and not self._pm_price_cache.empty:
-                    pm_universe = [c for c in self._pm_price_cache.columns if c in pred_score.index]
+                # if self._pm_price_cache is not None and not self._pm_price_cache.empty:
+                #     pm_universe = [c for c in self._pm_price_cache.columns if c in pred_score.index]
                 if not pm_universe:
                     pm_universe = base_target_codes
                 prices = self._get_pm_close_prices(list(pm_universe), look_start, look_end)
@@ -1055,7 +1055,16 @@ class OptimizedTopkDropoutStrategy(BaseSignalStrategy):
                 valid_cols = rets.count() >= min_obs
                 rets = rets.loc[:, list(valid_cols[valid_cols].index)]
                 rets = rets.dropna(how="all")
-                w_series = self.position_manager.optimize(rets)
+
+                # fetch benchmark close and compute returns (ensure same window)
+                bench_code = "SH000300"  # or inject via strategy kwargs/config
+                bench_prices = self._get_pm_close_prices([bench_code], look_start, look_end)
+                bench_rets = np.log(bench_prices[bench_code] / bench_prices[bench_code].shift(1)).dropna()
+
+                # align to rets’ index
+                bench_rets = bench_rets.reindex(rets.index).fillna(0.0).to_frame()
+
+                w_series = self.position_manager.optimize(rets, bench_rets)
                 if w_series is not None and not w_series.empty:
                     # Use PM proposed universe directly; normalize and keep positive weights
                     w = w_series.fillna(0.0).clip(lower=0.0)
@@ -1103,9 +1112,9 @@ class OptimizedTopkDropoutStrategy(BaseSignalStrategy):
                 if sell_price and sell_price > 0:
                     # compute in shares to avoid price-mismatch oversell
                     target_shares_at_sell_price = target_val / sell_price
-                    sell_amount = max(0.0, float(current_amount - target_shares_at_sell_price))
-                    # do not exceed current holdings due to numeric noise
-                    sell_amount = min(sell_amount, float(current_amount))
+                    desired_shares_to_sell = max(0.0, float(current_amount - target_shares_at_sell_price))
+                    sell_amount = int(np.floor(desired_shares_to_sell))
+                    sell_amount = min(sell_amount, int(np.floor(float(current_amount))))
                     if sell_amount > 0:
                         sell_order = Order(
                             stock_id=code,
@@ -1156,7 +1165,8 @@ class OptimizedTopkDropoutStrategy(BaseSignalStrategy):
             buy_value = need_val * scale
             if buy_value <= 0:
                 continue
-            buy_amount = float(buy_value / buy_price)
+            # round down to integer shares for buy
+            buy_amount = int(np.floor(buy_value / buy_price))
             if buy_amount <= 0:
                 continue
             buy_order = Order(

@@ -139,6 +139,41 @@ class RiskfolioPositionManager(BasePositionManager):
 
         port = rp.Portfolio(returns=clean)
 
+        # Optional constraints and benchmark-related settings. Defaults are relaxed to avoid infeasibility.
+        # Users can supply these via default_params or per-call params.
+        # - turnover: float or None
+        # - te: float or None (tracking error limit)
+        # - kindbench: bool (True if benchmark input are weights, False if returns)
+        # - lowerret / upperCVaR / uppermdd: floats or None
+        # - b: bounds passed to optimization (also passed below)
+        turnover_limit = cfg.get("turnover")
+        # Turnover constraint is enabled only if limits are provided
+        port.allowTO = turnover_limit is not None
+        if turnover_limit is not None:
+            port.turnover = float(turnover_limit)
+
+        te_limit = cfg.get("te")
+        port.kindbench = bool(cfg.get("kindbench", False))
+
+        # Benchmark: accept Series or single-column DataFrame of benchmark returns when kindbench=False.
+        if index is not None:
+            # if isinstance(index, pd.DataFrame):
+            #     if index.shape[1] > 1:
+            #         index = index.iloc[:, 0]
+            #     else:
+            #         index = index.squeeze()
+            port.benchindex = index
+
+        # TE constraint is enabled only if limits are provided and compatible inputs exist
+        port.allowTE = (te_limit is not None) and (index is not None)
+        if te_limit is not None:
+            port.TE = float(te_limit)
+
+        # Risk constraints are optional; unset by default
+        #port.lowerret = cfg.get("lowerret", None)
+        #port.upperCVaR = cfg.get("upperCVaR", None)
+        #port.uppermdd = cfg.get("uppermdd", None)
+
         # Compute mu and cov ourselves to avoid repeated PD warnings from riskfolio
         # and to apply a robust PD-fix before optimization
         # Mean vector
@@ -187,14 +222,40 @@ class RiskfolioPositionManager(BasePositionManager):
         port.mu = mu
         port.cov = cov
 
-        w = port.optimization(
-            model=cfg["model"],
-            rm=cfg["rm"],
-            obj=cfg["obj"],
-            rf=cfg["rf"],
-            l=cfg["l"],
-            hist=cfg["hist"],
-        )
+        # Run optimization with safe fallbacks when the problem is infeasible
+        try:
+            w = port.optimization(
+                model=cfg["model"],
+                rm=cfg["rm"],
+                obj=cfg["obj"],
+                rf=cfg["rf"],
+                l=cfg["l"],
+                hist=cfg["hist"],
+            )
+        except Exception as e:
+            print(f"Optimization failed with error: {e}")
+            w = None
+
+        # If infeasible or None, relax constraints and retry with a classic MV Sharpe problem
+        if w is None or (isinstance(w, (pd.Series, pd.DataFrame, np.ndarray)) and np.nan_to_num(np.array(w)).sum() == 0):
+            try:
+                # disable optional constraints
+                port.allowTE = False
+                port.allowTO = False
+                port.lowerret = None
+                port.upperCVaR = None
+                port.uppermdd = None
+                w = port.optimization(
+                    model="Classic",
+                    rm="MV",
+                    obj="Sharpe",
+                    rf=cfg["rf"],
+                    l=cfg["l"],
+                    hist=cfg["hist"],
+                )
+            except Exception as e:
+                print(f"fallback to MV Sharpe Optimization failed with error: {e}")
+                w = None
 
         # Ensure weights are a Series indexed by the same asset order
         if isinstance(w, pd.DataFrame):
