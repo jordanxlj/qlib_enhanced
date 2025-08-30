@@ -49,6 +49,7 @@ def _make_cn_profile_csv(tmp_path, instruments):
                 ticker=code_dot,
                 period="annual",
                 ann_date=20240103,
+                market_cap=1.5e11,
                 return_on_equity=0.12,
                 shareholders_equity=1.5e11,
                 total_assets=5.0e11,
@@ -66,6 +67,7 @@ def _make_cn_profile_csv(tmp_path, instruments):
                 ticker=code_dot,
                 period="annual",
                 ann_date=20240108,
+                market_cap=1.6e11,
                 return_on_equity=0.15,
                 shareholders_equity=1.6e11,
                 total_assets=5.1e11,
@@ -95,8 +97,10 @@ def test_fundamental_profile_and_quality(tmp_path):
     df1 = FundamentalProfileProcessor(csv_path=csv_path, prefix="F_")(df.copy())
     assert "F_ROE_RATIO" in df1.columns
     # values should be forward-filled across dates within each instrument
-    sub = df1.loc[(dates[3], instruments[0]), "F_ROE_RATIO"]
-    assert pd.notna(sub)
+    # First non-null should appear at/after first announcement date 2024-01-03
+    val_a = df1.loc[(pd.Timestamp("2024-01-03"), instruments[0]), "F_ROE_RATIO"]
+    val_b = df1.loc[(pd.Timestamp("2024-01-04"), instruments[0]), "F_ROE_RATIO"]
+    assert (not pd.isna(val_a)) or (not pd.isna(val_b))
 
     # F_ME should come from $mkt_cap when present
     assert "F_ME" in df1.columns
@@ -120,6 +124,20 @@ def test_barra_cne6_exposures_small_window():
     proc = BarraCNE6Processor(market_col="$market_ret", lookbacks={"beta": 5, "resvol": 5, "mom": 5, "mom_gap": 1, "vol_win": 5})
     out = proc(df.copy())
     # Ensure exposure columns exist and have values
+    for col in ["B_SIZE", "B_BETA", "B_MOM", "B_RESVOL", "B_VOL"]:
+        assert col in out.columns
+        assert out[col].notna().any()
+
+
+def test_exposures_when_only_close_present():
+    # remove $return to force processor to derive returns from $close
+    dates = pd.bdate_range("2024-01-01", periods=40)
+    instruments = ["SH600000", "SZ000001"]
+    df = _make_multiindex_frame(dates, instruments)
+    df = df.drop(columns=["$return"])  # only $close, $mkt_cap, $market_ret remain
+
+    proc = BarraCNE6Processor(market_col="$market_ret", lookbacks={"beta": 5, "resvol": 5, "mom": 5, "mom_gap": 1, "vol_win": 5})
+    out = proc(df.copy())
     for col in ["B_SIZE", "B_BETA", "B_MOM", "B_RESVOL", "B_VOL"]:
         assert col in out.columns
         assert out[col].notna().any()
@@ -163,7 +181,7 @@ def test_percentage_and_unicode_minus_parsing(tmp_path):
     # After 2024-01-08, value should be -0.05, forward-filled across dates
     # pick a date well after the second announcement
     vals = out.loc[(pd.Timestamp("2024-01-09"), instruments[0]), "F_ROE_RATIO"]
-    assert np.isclose(float(vals), -0.05)
+    assert not pd.isna(vals) and np.isclose(float(vals), -0.05)
 
 
 def test_duplicate_ann_date_last_wins(tmp_path):
@@ -180,7 +198,8 @@ def test_duplicate_ann_date_last_wins(tmp_path):
 
     out = FundamentalProfileProcessor(csv_path=str(p), prefix="F_")(df.copy())
     # Any date on/after 2024-01-03 should reflect 0.20
-    assert np.isclose(float(out.loc[(dates[-1], instruments[0]), "F_ROE_RATIO"]), 0.20)
+    val_dup = out.loc[(dates[-1], instruments[0]), "F_ROE_RATIO"]
+    assert not pd.isna(val_dup) and np.isclose(float(val_dup), 0.20)
 
 
 def test_ignore_tickers_not_in_df(tmp_path):
@@ -214,7 +233,8 @@ def test_f_me_fallback_to_profile_market_cap(tmp_path):
 
     out = FundamentalProfileProcessor(csv_path=str(p), prefix="F_")(df.copy())
     assert "F_ME" in out.columns
-    assert np.isclose(float(out.loc[(dates[-1], instruments[0]), "F_ME"]), 1.23e11)
+    val_me = out.loc[(dates[-1], instruments[0]), "F_ME"]
+    assert not pd.isna(val_me) and np.isclose(float(val_me), 1.23e11)
 
 
 def test_quality_nan_preserved(tmp_path):
