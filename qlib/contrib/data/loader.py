@@ -308,3 +308,85 @@ class Alpha158DL(QlibDataLoader):
                 names += ["VSUMD%d" % d for d in windows]
 
         return fields, names
+
+
+class AlphaCNE6DL(Alpha158DL):
+    """Dataloader to get Alpha158 base features plus raw series for CNE6.
+
+    Extends Alpha158DL by adding the following raw columns for the processor pipeline:
+      - $mkt_cap: read from market_cap.day.bin
+      - $turnover: read from turnover.day.bin
+      - $dividend_ratio: read from dividend_ratio.day.bin
+
+    Notes
+    -----
+    - City-value reference uses $close alignment as in Alpha158.
+    - Downstream processors (e.g., BarraCNE6Processor) will consume these columns
+      to compute Barra/CNE6 exposures.
+    """
+
+    @staticmethod
+    def get_feature_config(base_config=None):
+        # Start from Alpha158 default config
+        fields, names = Alpha158DL.get_feature_config(config=base_config or {
+            "kbar": {},
+            "price": {"windows": [0], "feature": ["OPEN", "HIGH", "LOW", "VWAP", "CLOSE"]},
+            "rolling": {},
+        })
+
+        # Append raw series needed by CNE6 processors
+        # These field names should map to provider columns backed by the corresponding *.day.bin files.
+        extra_fields = [
+            "$mkt_cap",          # market_cap.day.bin
+            "$turnover",         # turnover.day.bin
+            "$dividend_ratio",   # dividend_ratio.day.bin
+        ]
+        extra_names = [
+            "MKT_CAP",
+            "TURNOVER",
+            "DIV_RATIO",
+        ]
+        fields += extra_fields
+        names += extra_names
+
+        # Optionally include a simple return column for convenience
+        # Downstream processors can derive if missing; keep here for completeness.
+        if "$return" not in fields:
+            fields += ["$close/Ref($close,1)-1"]
+            names += ["RETURN1"]
+
+        # Liquidity factors (CNE6-style approximations):
+        # STOM: ln(sum of daily turnover over last 21 trading days)
+        # STOQ: ln(average of 3 monthly STOMs) ¡Ö ln(mean of 21-day turnover sums over 63 days)
+        # STOA: ln(average of 12 monthly STOMs) ¡Ö ln(mean of 21-day turnover sums over 252 days)
+        # ATR:  annualized traded value ratio (approx) = mean turnover over 252 days
+        liq_fields = [
+            "Log(Sum($turnover, 21)+1e-12)",            # LIQ_STOM
+            "Log(Mean(Sum($turnover, 21), 63)+1e-12)",  # LIQ_STOQ
+            "Log(Mean(Sum($turnover, 21), 252)+1e-12)", # LIQ_STOA
+            "Mean($turnover, 252)",                      # LIQ_ATR (approx, no decay)
+        ]
+        liq_names = [
+            "LIQ_STOM",
+            "LIQ_STOQ",
+            "LIQ_STOA",
+            "LIQ_ATR",
+        ]
+        fields += liq_fields
+        names += liq_names
+
+        # Size factors
+        # LNCAP: log of free-float market capitalization
+        # MIDCAP (approx raw): cubic of LNCAP; orthogonalization/standardization can be handled by processors
+        size_fields = [
+            "Log($mkt_cap+1e-12)",
+            "(Log($mkt_cap+1e-12)*Log($mkt_cap+1e-12)*Log($mkt_cap+1e-12))",
+        ]
+        size_names = [
+            "LNCAP",
+            "MIDCAP_RAW",
+        ]
+        fields += size_fields
+        names += size_names
+
+        return fields, names
