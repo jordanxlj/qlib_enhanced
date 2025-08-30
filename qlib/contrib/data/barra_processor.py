@@ -186,6 +186,7 @@ class FundamentalProfileProcessor(Processor):
                     col_series = col_series / 100.0
             prof[c] = col_series
 
+        prof = prof.dropna(subset=[self.date_col])  # Drop invalid ann_date
         prof.sort_values(["ticker", self.date_col], inplace=True)
         return prof
 
@@ -216,8 +217,9 @@ class FundamentalProfileProcessor(Processor):
             # Drop duplicate announcement dates per ticker, keep the latest record
             if ts.index.has_duplicates:
                 ts = ts[~ts.index.duplicated(keep="last")]
+            ts = ts.sort_index()  # Ensure monotonic after drop
             # To handle ann_date not in trade_dates (e.g., holidays), union indices and ffill, then reindex to trade_dates
-            union_index = trade_dates.union(ts.index).sort_values()
+            union_index = pd.DatetimeIndex(trade_dates.union(ts.index)).sort_values()
             aligned = ts.reindex(union_index, method="ffill").reindex(trade_dates).ffill()
             aligned["instrument"] = ticker
             aligned["datetime"] = aligned.index
