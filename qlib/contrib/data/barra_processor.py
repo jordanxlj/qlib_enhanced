@@ -130,12 +130,18 @@ class FundamentalProfileProcessor(Processor):
 
         # Robust ann_date parsing: accept 'YYYY-MM-DD' or numeric 'YYYYMMDD'
         raw_ad = prof[self.date_col]
+        # Filter out null ann_date before parsing
+        raw_ad = raw_ad.dropna()
+
+        # Handle possible float by rounding to int and str
         try:
-            ad = pd.to_datetime(raw_ad, errors="coerce")
-            if ad.isna().mean() > 0.5:
-                ad = pd.to_datetime(raw_ad.astype(str), format="%Y%m%d", errors="coerce")
+            raw_vals = pd.to_numeric(raw_ad, errors='coerce')
+            # Coerce to int, format as 8-digit string
+            raw_ad = raw_vals.round().astype('Int64').apply(lambda x: f"{x:08d}" if pd.notna(x) else "")
+            ad = pd.to_datetime(raw_ad, format='%Y%m%d', errors='coerce')
         except Exception:
-            ad = pd.to_datetime(raw_ad.astype(str), format="%Y%m%d", errors="coerce")
+            raw_ad = raw_ad.astype(str).str.strip()
+            ad = pd.to_datetime(raw_ad, errors='coerce')
         prof[self.date_col] = ad.dt.normalize()  # Ensure date-only, no time component
 
         # Normalize ticker to Qlib format, e.g., 300058.SZ -> SZ300058
@@ -214,13 +220,17 @@ class FundamentalProfileProcessor(Processor):
                 continue
             ts = g.set_index(self.date_col)[factor_cols].sort_index()
             ts.index = pd.to_datetime(ts.index).normalize()  # Normalize ann_date to date-only Timestamp
+            if len(trade_dates) == 0:
+                continue
+            idx_pos = trade_dates.searchsorted(ts.index, side="left")
+            idx_pos = np.clip(idx_pos, 0, len(trade_dates) - 1)
+            eff_index = trade_dates[idx_pos]
             # Drop duplicate announcement dates per ticker, keep the latest record
             if ts.index.has_duplicates:
                 ts = ts[~ts.index.duplicated(keep="last")]
             ts = ts.sort_index()  # Ensure monotonic after drop
-            # To handle ann_date not in trade_dates (e.g., holidays), union indices and ffill, then reindex to trade_dates
-            union_index = pd.DatetimeIndex(trade_dates.union(ts.index)).sort_values()
-            aligned = ts.reindex(union_index, method="ffill").reindex(trade_dates).ffill()
+            # Reindex to all trade dates and forward-fill
+            aligned = ts.reindex(trade_dates).ffill()
             aligned["instrument"] = ticker
             aligned["datetime"] = aligned.index
             frames.append(aligned)
