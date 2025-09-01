@@ -222,9 +222,10 @@ class FundamentalProfileProcessor(Processor):
             ts.index = pd.to_datetime(ts.index).normalize()  # Normalize ann_date to date-only Timestamp
             if len(trade_dates) == 0:
                 continue
-            idx_pos = trade_dates.searchsorted(ts.index, side="left")
+            idx_pos = trade_dates.searchsorted(ts.index, side="right")
             idx_pos = np.clip(idx_pos, 0, len(trade_dates) - 1)
             eff_index = trade_dates[idx_pos]
+            ts.index = eff_index
             # Drop duplicate announcement dates per ticker, keep the latest record
             if ts.index.has_duplicates:
                 ts = ts[~ts.index.duplicated(keep="last")]
@@ -322,13 +323,14 @@ class FundamentalProfileProcessor(Processor):
         ratio_map = {
             "F_DTOA_RATIO": "debt_to_assets",
             "F_DEBT_TO_EQUITY": "debt_to_equity",
-            "F_ASSET_TURNOVER": "asset_turnover",
-            "F_FIXED_ASSET_TURNOVER": "fixed_asset_turnover",
             "F_GROSS_MARGIN": "gross_margin",
             "F_OPERATING_MARGIN": "operating_margin",
             "F_NET_MARGIN": "net_margin",
             "F_ROA_RATIO": "return_on_assets",
             "F_ROE_RATIO": "return_on_equity",
+            "F_ROIC": "return_on_invested_capital",
+            "F_REVENUE_GROWTH": "revenue_growth",
+            "F_TOTAL_ASSETS_GROWTH": "total_assets_growth",
         }
         ratio_assign = {}
         for out, colname in ratio_map.items():
