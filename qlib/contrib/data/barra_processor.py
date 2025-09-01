@@ -9,6 +9,21 @@ import numpy as np
 from qlib.data.dataset.processor import Processor
 
 
+def normalize_ticker(x: str) -> str:
+    """Normalize raw ticker like '300058.SZ' -> 'SZ300058' for Qlib.
+
+    If exchange suffix is present (SZ/SH/BJ), move it to prefix and zero-pad code to 6 digits.
+    Otherwise, return the upper-cased stripped string.
+    """
+    s = str(x).strip().upper()
+    if "." in s:
+        base, exch = s.split(".")
+        base = base[-6:].zfill(6)
+        if exch in ("SZ", "SH", "BJ"):
+            return f"{exch}{base}"
+    return s
+
+
 class BarraCNE6Processor(Processor):
     """Processor to compute and attach Barra-style exposures via CNE6 functions.
 
@@ -107,12 +122,12 @@ class BarraCNE6Processor(Processor):
 class FundamentalProfileProcessor(Processor):
     """Load cn_profile fundamentals and align by announcement windows.
 
-    - Source: data/ann_report/cn_profile.csv
+    - Source: data/others/cn_profile.csv
     - Columns required: ticker, period, ann_date, <factor columns>
     - Values are valid from current ann_date until next ann_date for the same ticker.
     """
 
-    def __init__(self, csv_path: str = "data/ann_report/cn_profile.csv", prefix: str = "F_", date_col: str = "ann_date"):
+    def __init__(self, csv_path: str = "data/others/cn_profile.csv", prefix: str = "F_", date_col: str = "ann_date"):
         super().__init__()
         self.csv_path = csv_path
         self.prefix = prefix
@@ -145,16 +160,7 @@ class FundamentalProfileProcessor(Processor):
         prof[self.date_col] = ad.dt.normalize()  # Ensure date-only, no time component
 
         # Normalize ticker to Qlib format, e.g., 300058.SZ -> SZ300058
-        def _norm_ticker(x: str) -> str:
-            s = str(x).strip().upper()
-            if "." in s:
-                base, exch = s.split(".")
-                base = base[-6:].zfill(6)
-                if exch in ("SZ", "SH", "BJ"):
-                    return f"{exch}{base}"
-            return s
-
-        prof["ticker"] = prof["ticker"].map(_norm_ticker)
+        prof["ticker"] = prof["ticker"].map(normalize_ticker)
 
         # Coerce potential numeric fields to numeric
         key_cols = {"ticker", self.date_col, "period"}
@@ -165,12 +171,11 @@ class FundamentalProfileProcessor(Processor):
             "net_margin",
             "return_on_equity",
             "return_on_assets",
-            "asset_turnover",
-            "fixed_asset_turnover",
             "debt_to_equity",
             "debt_to_assets",
             "return_on_invested_capital",
-            "working_capital_turnover",
+            "revenue_growth",
+            "total_assets_growth",
         }
         for c in factor_cols_all:
             series = prof[c]
@@ -367,6 +372,12 @@ class FundamentalProfileProcessor(Processor):
         df = self._derive_core_fields(merged, df)
         df = self._set_market_equity(merged, df)
         df = self._assign_ratios(merged, df)
+        # Attach industry info if available via IndustryProcessor
+        try:
+            df = IndustryProcessor()(df)
+        except Exception:
+            # Silently skip if industry mapping not available
+            pass
         return df
 
 
@@ -417,12 +428,16 @@ class BarraFundamentalQualityProcessor(Processor):
         q_assign = {}
         if "F_DTOA_RATIO" in df.columns:
             q_assign["Q_DTOA"] = df["F_DTOA_RATIO"]
-        if "F_ASSET_TURNOVER" in df.columns:
-            q_assign["Q_ATO"] = df["F_ASSET_TURNOVER"]
         if "F_GROSS_MARGIN" in df.columns:
             q_assign["Q_GPM"] = df["F_GROSS_MARGIN"]
+        if "F_OPERATING_MARGIN" in df.columns:
+            q_assign["Q_OPM"] = df["F_OPERATING_MARGIN"]
+        if "F_NET_MARGIN" in df.columns:
+            q_assign["Q_NPM"] = df["F_NET_MARGIN"]
         if "F_ROA_RATIO" in df.columns:
             q_assign["Q_ROA"] = df["F_ROA_RATIO"]
+        if "F_TOTAL_ASSETS_GROWTH" not in q_assign:
+            q_assign["Q_TAGR"] = df["F_TOTAL_ASSETS_GROWTH"]
 
         # Leverage (fallback)
         if "Q_MLEV" not in q_assign:
@@ -457,6 +472,79 @@ class BarraFundamentalQualityProcessor(Processor):
         if q_assign:
             df = df.assign(**q_assign)
 
+        return df
+
+
+class IndustryProcessor(Processor):
+    """Attach industry code/name per ticker from a company facts file.
+
+    - Source: data/others/cn_company_facts.csv (configurable)
+    - Required columns: ticker, industry_code, industry
+    - Values are static per ticker and will be attached to every date row.
+    """
+
+    def __init__(self, csv_path: str = "data/others/cn_company_facts.csv", prefix: str = "F_", code_col: str = "industry_code", name_col: str = "industry"):
+        super().__init__()
+        self.csv_path = csv_path
+        self.prefix = prefix
+        self.code_col = code_col
+        self.name_col = name_col
+        self._cache = None  # DataFrame with columns: ticker, code_col, name_col
+
+    def fit(self, df: pd.DataFrame):
+        return self
+
+    def _load_mapping(self) -> pd.DataFrame:
+        # Try reading as CSV; if missing extension, try appending .csv
+        try:
+            facts = pd.read_csv(self.csv_path, low_memory=False)
+        except Exception:
+            try:
+                facts = pd.read_csv(f"{self.csv_path}.csv", low_memory=False)
+            except Exception as e2:
+                raise FileNotFoundError(f"Failed to read company facts from {self.csv_path}: {e2}")
+
+        facts.columns = [str(c).strip().lower() for c in facts.columns]
+        if "ticker" not in facts.columns:
+            raise ValueError("cn_company_facts must include a 'ticker' column")
+        if self.code_col not in facts.columns and self.name_col not in facts.columns:
+            raise ValueError(f"cn_company_facts must include '{self.code_col}' or '{self.name_col}' column")
+
+        # Normalize tickers to Qlib format, e.g., 300058.SZ -> SZ300058
+        facts["ticker"] = facts["ticker"].map(normalize_ticker)
+
+        # Keep only necessary columns
+        keep_cols = ["ticker"] + [c for c in [self.code_col, self.name_col] if c in facts.columns]
+        facts = facts[keep_cols].copy()
+
+        # Deduplicate by ticker: keep last non-null entries
+        facts.sort_values(["ticker"], inplace=True)
+        facts = facts.drop_duplicates(subset=["ticker"], keep="last")
+        return facts
+
+    def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        assert isinstance(df.index, pd.MultiIndex) and df.index.nlevels == 2, "Input df must be MultiIndex (datetime, instrument)"
+
+        if self._cache is None:
+            self._cache = self._load_mapping()
+        facts = self._cache
+        if facts.empty:
+            return df
+
+        # Build mapping dicts
+        code_map = facts.set_index("ticker")[self.code_col].to_dict() if self.code_col in facts.columns else {}
+        name_map = facts.set_index("ticker")[self.name_col].to_dict() if self.name_col in facts.columns else {}
+
+        inst_index = df.index.get_level_values("instrument").astype(str)
+        assign = {}
+        if code_map:
+            assign[f"{self.prefix}INDUSTRY_CODE"] = inst_index.map(code_map)
+        if name_map:
+            assign[f"{self.prefix}INDUSTRY"] = inst_index.map(name_map)
+        if assign:
+            df = df.assign(**assign)
         return df
 
 
