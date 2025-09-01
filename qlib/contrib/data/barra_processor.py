@@ -24,6 +24,23 @@ def normalize_ticker(x: str) -> str:
     return s
 
 
+def trim_outliers(series: pd.Series, lower_q: float = 0.05, upper_q: float = 0.95) -> pd.Series:
+    """Mask values outside [lower_q, upper_q] quantiles with NaN.
+
+    Expects a numeric Series. Inf values are treated as NaN for quantile calculation.
+    If quantiles are invalid or identical, returns the original series.
+    """
+    s = pd.to_numeric(series, errors="coerce")
+    finite = s.replace([np.inf, -np.inf], np.nan).dropna()
+    if finite.empty:
+        return s
+    ql = finite.quantile(lower_q)
+    qh = finite.quantile(upper_q)
+    if pd.isna(ql) or pd.isna(qh) or not (qh > ql):
+        return s
+    return s.mask((s < ql) | (s > qh))
+
+
 class BarraCNE6Processor(Processor):
     """Processor to compute and attach Barra-style exposures via CNE6 functions.
 
@@ -195,6 +212,9 @@ class FundamentalProfileProcessor(Processor):
                 finite = col_series.replace([np.inf, -np.inf], np.nan).dropna()
                 if not finite.empty and finite.quantile(0.95) > 1.5:
                     col_series = col_series / 100.0
+
+            # Trim outliers: keep within [0.05, 0.95] quantile range
+            #col_series = trim_outliers(col_series, 0.05, 0.95)
             prof[c] = col_series
 
         prof = prof.dropna(subset=[self.date_col])  # Drop invalid ann_date
