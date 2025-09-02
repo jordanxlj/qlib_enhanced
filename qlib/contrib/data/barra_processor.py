@@ -62,7 +62,7 @@ class BarraCNE6Processor(Processor):
         self,
         *,
         market_col: str = "$market_ret",
-        turnover_col: Optional[str] = None,
+        turnover_col: str = "$turnover",
         eps_trailing_col: Optional[str] = None,
         eps_pred_col: Optional[str] = None,
         price_col: str = "$close",
@@ -97,7 +97,7 @@ class BarraCNE6Processor(Processor):
             close = pivot(self.price_col)
             if close is not None:
                 returns = close.pct_change()
-        mcap = pivot("$mkt_cap")
+        mcap = pivot("$market_cap")
         market = pivot(self.market_col)
         market_series = market.iloc[:, 0] if market is not None else None
 
@@ -337,8 +337,8 @@ class FundamentalProfileProcessor(Processor):
     def _set_market_equity(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
         get = lambda c: merged.get(c, pd.Series(index=merged.index, dtype=float))
         me = get("market_cap")
-        if "$mkt_cap" in df.columns:
-            df["F_ME"] = df["$mkt_cap"].astype(float)
+        if "$market_cap" in df.columns:
+            df["F_ME"] = df["$market_cap"].astype(float)
         elif not me.empty:
             me = me.groupby(level=1).ffill()
             df["F_ME"] = me.reindex(df.index).astype(float)
@@ -384,6 +384,7 @@ class FundamentalProfileProcessor(Processor):
 
         inst_level, date_level = self._extract_index_levels(df)
         trade_dates, code_set = self._prepare_trade_data(df, inst_level, date_level)
+
         merged = self._build_merged_fundamentals(prof, trade_dates, code_set)
         if merged.empty:
             return df
