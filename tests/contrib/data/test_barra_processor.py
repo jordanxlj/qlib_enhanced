@@ -6,6 +6,7 @@ from qlib.contrib.data.barra_processor import (
     FundamentalProfileProcessor,
     BarraFundamentalQualityProcessor,
     BarraCNE6Processor,
+    IndustryMomentumProcessor,
 )
 
 
@@ -26,7 +27,7 @@ def _make_multiindex_frame(dates, instruments) -> pd.DataFrame:
     )
     df["$close"] = ser_close
     # simple market cap scaled by close
-    df["$mkt_cap"] = (ser_close * 1e8).astype(float)
+    df["$market_cap"] = (ser_close * 1e8).astype(float)
     # explicit return per instrument
     rets = df["$close"].groupby(level="instrument").pct_change().fillna(0.0)
     df["$return"] = rets
@@ -102,11 +103,11 @@ def test_fundamental_profile_and_quality(tmp_path):
     val_b = df1.loc[(pd.Timestamp("2024-01-04"), instruments[0]), "F_ROE_RATIO"]
     assert (not pd.isna(val_a)) or (not pd.isna(val_b))
 
-    # F_ME should come from $mkt_cap when present
+    # F_ME should come from $market_cap when present
     assert "F_ME" in df1.columns
     assert np.isclose(
         float(df1.loc[(dates[5], instruments[1]), "F_ME"]),
-        float(df.loc[(dates[5], instruments[1]), "$mkt_cap"]),
+        float(df.loc[(dates[5], instruments[1]), "$market_cap"]),
     )
 
     df2 = BarraFundamentalQualityProcessor()(df1.copy())
@@ -134,7 +135,7 @@ def test_exposures_when_only_close_present():
     dates = pd.bdate_range("2024-01-01", periods=40)
     instruments = ["SH600000", "SZ000001"]
     df = _make_multiindex_frame(dates, instruments)
-    df = df.drop(columns=["$return"])  # only $close, $mkt_cap, $market_ret remain
+    df = df.drop(columns=["$return"])  # only $close, $market_cap, $market_ret remain
 
     proc = BarraCNE6Processor(market_col="$market_ret", lookbacks={"beta": 5, "resvol": 5, "mom": 5, "mom_gap": 1, "vol_win": 5})
     out = proc(df.copy())
@@ -222,8 +223,8 @@ def test_f_me_fallback_to_profile_market_cap(tmp_path):
     dates = pd.bdate_range("2024-01-01", periods=3)
     instruments = ["SH600000"]
     df = _make_multiindex_frame(dates, instruments)
-    # remove $mkt_cap to force fallback
-    df = df.drop(columns=["$mkt_cap"]) 
+    # remove $market_cap to force fallback
+    df = df.drop(columns=["$market_cap"])
 
     rows = [
         dict(ticker="600000.SH", period="annual", ann_date=20240103, market_cap=1.23e11),
@@ -256,4 +257,43 @@ def test_quality_nan_preserved(tmp_path):
     # Q_DTOA should be NaN when TA is NaN (no zero-fill)
     assert df2["Q_DTOA"].isna().any()
 
+
+def test_industry_momentum_basic():
+    dates = pd.bdate_range("2024-01-01", periods=8)
+    instruments = ["SH600000", "SZ000001", "SZ000002"]
+    df = _make_multiindex_frame(dates, instruments)
+    # Make equal caps for stability and equal weights in BANK industry
+    df["$market_cap"] = 1.0e8
+    # Attach industry codes: two in BANK, one in TECH
+    codes = {
+        (d, instruments[0]): "BANK" for d in dates
+    }
+    codes.update({(d, instruments[1]): "BANK" for d in dates})
+    codes.update({(d, instruments[2]): "TECH" for d in dates})
+    df["F_INDUSTRY_CODE"] = pd.Series(codes)
+
+    proc = IndustryMomentumProcessor(
+        mcap_col="$market_cap", window=3, halflife=2, out_col="B_INDMOM"
+    )
+    out = proc(df.copy())
+    assert "B_INDMOM" in out.columns
+    # On last date, TECH industry has only one stock, so INDMOM ¡Ö 0
+    d_last = dates[-1]
+    tech_val = float(out.loc[(d_last, instruments[2]), "B_INDMOM"])
+    assert np.isfinite(tech_val) and np.isclose(tech_val, 0.0, atol=1e-10)
+
+    # For BANK industry with equal weights 0.5, verify
+    # INDMOM1 - INDMOM2 = -0.5*(RS1 - RS2)
+    # Recompute RS using same definition
+    rets = out["$return"].unstack(level="instrument").sort_index()
+    weights = np.exp(-np.log(2) * np.arange(3) / 2)[::-1]
+    weights /= weights.sum()
+    log1p = np.log1p(rets.fillna(0.0))
+    rs_df = log1p.rolling(3).apply(lambda x: np.nansum(weights * np.nan_to_num(x)), raw=True)
+    rs1 = float(rs_df[instruments[0]].iloc[-1])
+    rs2 = float(rs_df[instruments[1]].iloc[-1])
+    indmom1 = float(out.loc[(d_last, instruments[0]), "B_INDMOM"])
+    indmom2 = float(out.loc[(d_last, instruments[1]), "B_INDMOM"])
+    assert np.isfinite(indmom1) and np.isfinite(indmom2)
+    assert np.isclose(indmom1 - indmom2, -0.5 * (rs1 - rs2), atol=1e-10)
 

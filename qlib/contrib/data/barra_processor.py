@@ -457,7 +457,8 @@ class BarraFundamentalQualityProcessor(Processor):
             q_assign["Q_NPM"] = df["F_NET_MARGIN"]
         if "F_ROA_RATIO" in df.columns:
             q_assign["Q_ROA"] = df["F_ROA_RATIO"]
-        if "F_TOTAL_ASSETS_GROWTH" not in q_assign:
+        # Attach total assets growth only when present
+        if "Q_TAGR" not in q_assign and "F_TOTAL_ASSETS_GROWTH" in df.columns:
             q_assign["Q_TAGR"] = df["F_TOTAL_ASSETS_GROWTH"]
 
         # Leverage (fallback)
@@ -566,6 +567,138 @@ class IndustryProcessor(Processor):
             assign[f"{self.prefix}INDUSTRY"] = inst_index.map(name_map)
         if assign:
             df = df.assign(**assign)
+        return df
+
+
+class IndustryMomentumProcessor(Processor):
+    """Compute Industry Momentum per instrument based on industry_code.
+
+    Definitions (per spec):
+      1) Stock relative strength RS_s(t) = sum_{tau in window} w_{t-t} * ln(1 + r_s(t))
+         - window ~ 6 months (default 126 trading days);
+         - weights are half-life exponential (default halflife ~ 21 trading days).
+      2) Industry relative strength RS_I(t) = sum_i c_i(t) * RS_i(t)
+         - c_i(t): normalized weights proportional to sqrt(market_cap_i(t)).
+      3) Final factor for stock s: INDMOM_s(t) = - (c_s(t) * RS_s(t) - RS_I(t))
+
+    Requirements:
+      - '$return' or '$close' to compute returns
+      - '$market_cap' for weights
+      - 'F_INDUSTRY_CODE' attached by IndustryProcessor
+    Output column: 'B_INDMOM'
+    """
+
+    def __init__(
+        self,
+        *,
+        return_col: str = "$return",
+        close_col: str = "$close",
+        mcap_col: str = "$market_cap",
+        industry_col: str = "F_INDUSTRY_CODE",
+        out_col: str = "B_INDMOM",
+        window: int = 126,
+        halflife: int = 21,
+    ):
+        super().__init__()
+        self.return_col = return_col
+        self.close_col = close_col
+        self.mcap_col = mcap_col
+        self.industry_col = industry_col
+        self.out_col = out_col
+        self.window = int(window)
+        self.halflife = int(halflife)
+
+    def fit(self, df: pd.DataFrame):
+        return self
+
+    def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        assert isinstance(df.index, pd.MultiIndex) and df.index.nlevels == 2, "Input df must be MultiIndex (datetime, instrument)"
+
+        # Helper to pivot a column to wide (date x instrument)
+        def pivot(col: str) -> Optional[pd.DataFrame]:
+            if col is None or col not in df.columns:
+                return None
+            return df[col].unstack(level="instrument").sort_index()
+
+        rets = pivot(self.return_col)
+        if rets is None:
+            close = pivot(self.close_col)
+            if close is None:
+                return df
+            rets = close.pct_change()
+
+        mcap = pivot(self.mcap_col)
+        if mcap is None:
+            return df
+
+        # Industry mapping per instrument (use last non-null across time)
+        if self.industry_col not in df.columns:
+            return df
+        ind_map = df[self.industry_col].groupby(level="instrument").last()
+        ind_map = ind_map.dropna().astype(str)
+        if ind_map.empty:
+            return df
+
+        # Align columns to instruments with industry mapping
+        common_cols = [c for c in rets.columns if c in ind_map.index]
+        if not common_cols:
+            return df
+        rets = rets[common_cols]
+        mcap = mcap.reindex(columns=common_cols)
+
+        # Compute RS per stock via weighted rolling sum of log(1+r)
+        weights = np.exp(-np.log(2) * np.arange(self.window) / max(self.halflife, 1))[::-1]
+        weights = weights / weights.sum()
+        log1p = np.log1p(rets.fillna(0.0))
+        rs_df = log1p.rolling(self.window).apply(lambda x: np.nansum(weights * np.nan_to_num(x)), raw=True)
+
+        # Compute c_i(t) ~ normalized sqrt(market_cap)
+        w_raw = np.sqrt(mcap.clip(lower=0)).replace([np.inf, -np.inf], np.nan)
+        w_sum = w_raw.sum(axis=1).replace(0, np.nan)
+        w_norm = w_raw.div(w_sum, axis=0)
+
+        # Group instruments by industry code
+        ind_to_cols: Dict[str, list] = {}
+        for inst, ind in ind_map.items():
+            if inst in common_cols:
+                ind_to_cols.setdefault(ind, []).append(inst)
+        if not ind_to_cols:
+            return df
+
+        # Industry RS per industry per day
+        industry_rs = {}
+        for ind, cols in ind_to_cols.items():
+            if not cols:
+                continue
+            w_ind = w_norm[cols]
+            w_ind = w_ind.div(w_ind.sum(axis=1), axis=0)
+            rs_ind = (rs_df[cols] * w_ind).sum(axis=1)
+            industry_rs[ind] = rs_ind
+        if not industry_rs:
+            return df
+        industry_rs_df = pd.DataFrame(industry_rs).reindex(rs_df.index)
+
+        # Build per-instrument industry RS aligned by instrument
+        rs_ind_for_inst = pd.DataFrame(index=rs_df.index, columns=common_cols, dtype=float)
+        for col in common_cols:
+            ind = ind_map.get(col)
+            if ind in industry_rs_df.columns:
+                rs_ind_for_inst[col] = industry_rs_df[ind]
+
+        # Final factor: RS_I - c_s * RS_s
+        # Normalize weights within each industry daily
+        c_norm = pd.DataFrame(index=rs_df.index, columns=common_cols, dtype=float)
+        for ind, cols in ind_to_cols.items():
+            w_ind = w_raw[cols]
+            w_ind = w_ind.div(w_ind.sum(axis=1), axis=0)
+            c_norm[cols] = w_ind
+        indmom = rs_ind_for_inst - c_norm * rs_df
+
+        # Attach back to long format
+        indmom_long = indmom.stack().rename(self.out_col)
+        df = df.assign(**{self.out_col: indmom_long.reindex(df.index).astype(float)})
         return df
 
 
