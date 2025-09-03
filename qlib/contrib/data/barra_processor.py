@@ -47,7 +47,7 @@ class BarraCNE6Processor(Processor):
     It expects the input DataFrame to be MultiIndex (datetime, instrument),
     with columns including at least:
       - "$return" (or precomputed returns)
-      - "$mkt_cap"
+      - "$market_cap"
       - a market returns column (default "$market_ret")
     Optionally:
       - turnover column
@@ -574,7 +574,7 @@ class IndustryMomentumProcessor(Processor):
     """Compute Industry Momentum per instrument based on industry_code.
 
     Definitions (per spec):
-      1) Stock relative strength RS_s(t) = sum_{tau in window} w_{t-t} * ln(1 + r_s(t))
+      1) Stock relative strength RS_s(t) = sum_{tau in window} w_{t-¦Ó} * ln(1 + r_s(¦Ó))
          - window ~ 6 months (default 126 trading days);
          - weights are half-life exponential (default halflife ~ 21 trading days).
       2) Industry relative strength RS_I(t) = sum_i c_i(t) * RS_i(t)

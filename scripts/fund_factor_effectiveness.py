@@ -23,6 +23,7 @@ from qlib.data import D
 from qlib.contrib.data.barra_processor import (
     FundamentalProfileProcessor,
     BarraFundamentalQualityProcessor,
+    IndustryMomentumProcessor,
 )
 
 
@@ -273,24 +274,26 @@ def _analyze_factor_distribution(df: pd.DataFrame, fac: str) -> None:
 
 
 def _build_base_index(instruments, start: str, end: str) -> pd.DataFrame:
-    """Create a MultiIndex (datetime, instrument) frame with $close, $mkt_cap and next-day returns."""
-    feats = D.features(D.instruments(instruments), ["$close", "$mkt_cap"], start_time=start, end_time=end)
+    """Create a MultiIndex (datetime, instrument) frame with $close, $market_cap and next-day returns."""
+    feats = D.features(D.instruments(instruments), ["$close", "$market_cap"], start_time=start, end_time=end)
     feats = feats.sort_index()
     # next-day return per instrument based on $close
     nxt_close = feats[["$close"]].groupby(level="instrument").shift(-1)
     ret1 = (nxt_close - feats[["$close"]]) / feats[["$close"]]
     base = pd.DataFrame(index=feats.index)
     base["$close"] = feats["$close"]
-    if "$mkt_cap" in feats.columns:
-        base["$mkt_cap"] = feats["$mkt_cap"]
+    if "$market_cap" in feats.columns:
+        base["$market_cap"] = feats["$market_cap"]
     base["target_ret1"] = ret1["$close"]
     return base
 
 
 def _apply_fundamental_processors(df: pd.DataFrame) -> pd.DataFrame:
     """Attach F_* and Q_* factors from cn_profile.csv and compute quality factors."""
-    df = FundamentalProfileProcessor(csv_path="data/ann_report/cn_profile.csv", prefix="F_")(df)
+    df = FundamentalProfileProcessor(csv_path="data/others/cn_profile.csv", prefix="F_")(df)
     df = BarraFundamentalQualityProcessor()(df)
+    # Add Industry Momentum based on F_INDUSTRY_CODE and $market_cap/$close
+    df = IndustryMomentumProcessor(out_col="B_INDMOM")(df)
     return df
 
 
@@ -334,7 +337,7 @@ def main():
     qlib.init(provider_uri="data", region="cn")
 
     # Build universe from cn_profile.csv coverage to avoid all-zero factors
-    prof = pd.read_csv("data/ann_report/cn_profile.csv")
+    prof = pd.read_csv("data/others/cn_profile.csv")
     prof.columns = [c.lower() for c in prof.columns]
 
     # quick sanity: restrict to tickers that have any non-null in key ratio columns
@@ -363,14 +366,23 @@ def main():
             continue
 
     # Use instruments with cn_profile coverage and available in provider
-    instruments = "csi300"
+    # IMPORTANT: use a static list to avoid dynamic index membership gaps (e.g., SH600004 dropping from CSI300)
+    instruments = all_inst if all_inst else "csi300"
     start = "2020-01-01"  # longer window to increase valid samples
     end = "2025-07-01"
 
+    '''
     # Analyze raw for ROE and ROA
-    _analyze_raw_profile_factor("data/ann_report/cn_profile.csv", instruments, start, end, raw_col="return_on_equity")
-    _analyze_raw_profile_factor("data/ann_report/cn_profile.csv", instruments, start, end, raw_col="return_on_assets")
-
+    _analyze_raw_profile_factor("data/others/cn_profile.csv", instruments, start, end, raw_col="return_on_equity")
+    _analyze_raw_profile_factor("data/others/cn_profile.csv", instruments, start, end, raw_col="return_on_assets")
+    _analyze_raw_profile_factor("data/others/cn_profile.csv", instruments, start, end, raw_col="gross_margin")
+    _analyze_raw_profile_factor("data/others/cn_profile.csv", instruments, start, end, raw_col="operating_margin")
+    _analyze_raw_profile_factor("data/others/cn_profile.csv", instruments, start, end, raw_col="net_margin")
+    _analyze_raw_profile_factor("data/others/cn_profile.csv", instruments, start, end, raw_col="debt_to_equity")
+    _analyze_raw_profile_factor("data/others/cn_profile.csv", instruments, start, end, raw_col="debt_to_assets")
+    _analyze_raw_profile_factor("data/others/cn_profile.csv", instruments, start, end, raw_col="revenue_growth")
+    _analyze_raw_profile_factor("data/others/cn_profile.csv", instruments, start, end, raw_col="total_assets_growth")
+    '''
     base = _build_base_index(instruments, start, end)
     df = _apply_fundamental_processors(base)
 
@@ -384,8 +396,9 @@ def main():
     _analyze_factor_distribution(df, "F_DEBT_TO_EQUITY")
     _analyze_factor_distribution(df, "F_REVENUE_GROWTH")
     _analyze_factor_distribution(df, "F_TOTAL_ASSETS_GROWTH")
+    _analyze_factor_distribution(df, "B_INDMOM")
 
-    fac_list = ["F_ROE_RATIO", "F_ROA_RATIO", "F_GROSS_MARGIN", "F_OPERATING_MARGIN", "F_NET_MARGIN", "F_DTOA_RATIO", "F_DEBT_TO_EQUITY", "F_REVENUE_GROWTH", "F_TOTAL_ASSETS_GROWTH"]
+    fac_list = ["F_ROE_RATIO", "F_ROA_RATIO", "F_GROSS_MARGIN", "F_OPERATING_MARGIN", "F_NET_MARGIN", "F_DTOA_RATIO", "F_DEBT_TO_EQUITY", "F_REVENUE_GROWTH", "F_TOTAL_ASSETS_GROWTH", "F_INDUSTRY", "F_INDUSTRY_CODE", "B_INDMOM"]
     # Export F_ROE_RATIO and F_ROA_RATIO to CSV
     for fac in fac_list:
         if fac in df.columns:
@@ -397,7 +410,7 @@ def main():
     # Assert alignment for ROE and ROA
     _assert_factor_alignment(
         df,
-        csv_path="data/ann_report/cn_profile.csv",
+        csv_path="data/others/cn_profile.csv",
         raw_ticker="000001.SZ",
         dates=["2024-03-15", "2025-03-15"],
         factor_name="F_ROE_RATIO",
@@ -405,7 +418,7 @@ def main():
     )
     _assert_factor_alignment(
         df,
-        csv_path="data/ann_report/cn_profile.csv",
+        csv_path="data/others/cn_profile.csv",
         raw_ticker="000002.SZ",
         dates=["2024-03-15", "2025-03-15"],
         factor_name="F_ROA_RATIO",
@@ -413,7 +426,7 @@ def main():
     )
     _assert_factor_alignment(
         df,
-        csv_path="data/ann_report/cn_profile.csv",
+        csv_path="data/others/cn_profile.csv",
         raw_ticker="000002.SZ",
         dates=["2024-03-15", "2025-03-15"],
         factor_name="F_GROSS_MARGIN",
@@ -421,7 +434,7 @@ def main():
     )
     _assert_factor_alignment(
         df,
-        csv_path="data/ann_report/cn_profile.csv",
+        csv_path="data/others/cn_profile.csv",
         raw_ticker="000002.SZ",
         dates=["2024-03-15", "2025-03-15"],
         factor_name="F_OPERATING_MARGIN",
@@ -429,7 +442,7 @@ def main():
     )
     _assert_factor_alignment(
         df,
-        csv_path="data/ann_report/cn_profile.csv",
+        csv_path="data/others/cn_profile.csv",
         raw_ticker="000002.SZ",
         dates=["2024-03-15", "2025-03-15"],
         factor_name="F_NET_MARGIN",
@@ -454,8 +467,10 @@ def main():
         # quality (constructed)
         "Q_MLEV", "Q_BLEV", "Q_DTOA", "Q_ATO", "Q_GP", "Q_GPM", "Q_ROA", "Q_ABS", "Q_ACF",
         # direct ratios from cn_profile (if present)
-        "F_DTOA_RATIO", "F_DEBT_TO_EQUITY", "F_ASSET_TURNOVER", "F_FIXED_ASSET_TURNOVER",
+        "F_DTOA_RATIO", "F_DEBT_TO_EQUITY", 
         "F_GROSS_MARGIN", "F_OPERATING_MARGIN", "F_NET_MARGIN", "F_ROA_RATIO", "F_ROE_RATIO",
+        # industry momentum
+        "B_INDMOM",
     ]
     diag = (
         df[["F_ROE_RATIO", "target_ret1"]]
