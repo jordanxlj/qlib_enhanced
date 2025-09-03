@@ -7,7 +7,9 @@ import pandas as pd
 import numpy as np
 
 from qlib.data.dataset.processor import Processor
+from qlib.log import get_module_logger
 
+logger = get_module_logger("BarraProcessor")
 
 def normalize_ticker(x: str) -> str:
     """Normalize raw ticker like '300058.SZ' -> 'SZ300058' for Qlib.
@@ -652,10 +654,21 @@ class IndustryMomentumProcessor(Processor):
         weights = np.exp(-np.log(2) * np.arange(self.window) / max(self.halflife, 1))[::-1]
         weights = weights / weights.sum()
         log1p = np.log1p(rets.fillna(0.0))
-        rs_df = log1p.rolling(self.window).apply(lambda x: np.nansum(weights * np.nan_to_num(x)), raw=True)
+        # Faster rolling weighted sum with optional numba acceleration
+        def _weighted_sum(x: np.ndarray) -> float:
+            return float(np.nansum(weights * np.nan_to_num(x)))
+        try:
+            logger.info("Using numba weighted sum implementation")
+            rs_df = log1p.rolling(self.window).apply(_weighted_sum, raw=True, engine="numba", engine_kwargs={'parallel': True})
+            logger.info("finished Using numba weighted sum implementation")
+        except Exception:
+            logger.info("Using fallback weighted sum implementation")
+            rs_df = log1p.rolling(self.window).apply(_weighted_sum, raw=True)
 
         # Compute c_i(t) ~ normalized sqrt(market_cap)
-        w_raw = np.sqrt(mcap.clip(lower=0)).replace([np.inf, -np.inf], np.nan)
+        # Use forward-filled market cap and fall back to equal weights when missing
+        mcap = mcap.replace([np.inf, -np.inf], np.nan).ffill()
+        w_raw = np.sqrt(mcap.clip(lower=0)).replace([np.inf, -np.inf], np.nan).fillna(1.0)
         w_sum = w_raw.sum(axis=1).replace(0, np.nan)
         w_norm = w_raw.div(w_sum, axis=0)
 
@@ -717,7 +730,12 @@ def compute_momentum(returns: pd.DataFrame, mom_win: int = 504, gap: int = 21, h
     weights = np.exp(-np.log(2) * np.arange(mom_win) / max(halflife, 1))[::-1]
     weights /= weights.sum()
     log1p = np.log1p(returns.fillna(0))
-    comp = log1p.rolling(mom_win).apply(lambda x: np.nansum(weights * np.nan_to_num(x)), raw=True)
+    def _weighted_sum(x: np.ndarray) -> float:
+        return float(np.nansum(weights * np.nan_to_num(x)))
+    try:
+        comp = log1p.rolling(mom_win).apply(_weighted_sum, raw=True, engine="numba")
+    except Exception:
+        comp = log1p.rolling(mom_win).apply(_weighted_sum, raw=True)
     last = comp.shift(gap).iloc[-1]
     return last.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
