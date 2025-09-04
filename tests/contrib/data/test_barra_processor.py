@@ -297,3 +297,34 @@ def test_industry_momentum_basic():
     assert np.isfinite(indmom1) and np.isfinite(indmom2)
     assert np.isclose(indmom1 - indmom2, -0.5 * (rs1 - rs2), atol=1e-10)
 
+
+def test_industry_momentum_index_column_name_robustness():
+    dates = pd.bdate_range("2024-01-01", periods=12)
+    instruments = ["SH600000", "SZ000001", "SZ000002"]
+    df = _make_multiindex_frame(dates, instruments)
+    df["$market_cap"] = 1.0e8
+    codes = {(d, instruments[0]): "BANK" for d in dates}
+    codes.update({(d, instruments[1]): "BANK" for d in dates})
+    codes.update({(d, instruments[2]): "TECH" for d in dates})
+    df["F_INDUSTRY_CODE"] = pd.Series(codes)
+
+    proc = IndustryMomentumProcessor(mcap_col="$market_cap", window=4, halflife=2, out_col="B_INDMOM")
+
+    # Case 1: names present
+    out1 = proc(df.copy())
+    assert out1["B_INDMOM"].notna().any()
+
+    # Case 2: drop index names
+    df2 = df.copy()
+    df2.index = df2.index.set_names([None, None])
+    out2 = proc(df2)
+    assert out2["B_INDMOM"].notna().any()
+
+    # Case 3: swap level order (instrument, datetime)
+    df3 = df.copy()
+    df3.index = df3.index.reorder_levels(["instrument", "datetime"])  # reorder only
+    df3 = df3.sort_index()
+    out3 = proc(df3)
+    if not out3["B_INDMOM"].notna().any():
+        print("All NaN in swapped case; non-null:", out3["B_INDMOM"].notna().sum())
+    assert out3["B_INDMOM"].notna().any()

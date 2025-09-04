@@ -615,7 +615,19 @@ class IndustryMomentumProcessor(Processor):
         def pivot(col: str) -> Optional[pd.DataFrame]:
             if col not in df.columns:
                 return None
-            return df[col].unstack(level="instrument").sort_index().astype(np.float32)
+            ser = df[col]
+            if not isinstance(ser.index, pd.MultiIndex) or ser.index.nlevels < 2:
+                return None
+            idx_names = list(ser.index.names)
+            if "instrument" in idx_names:
+                inst_level = idx_names.index("instrument")
+            else:
+                inst_level = ser.index.nlevels - 1  # assume last level is instrument
+            wide = ser.unstack(level=inst_level).sort_index().astype(np.float32)
+            # Normalize index/column names for stable downstream ops
+            wide.index.name = "datetime"
+            wide.columns.name = "instrument"
+            return wide
 
         rets = pivot(self.return_col)
         if rets is None:
@@ -629,17 +641,16 @@ class IndustryMomentumProcessor(Processor):
 
         if self.industry_col not in df.columns:
             return df
-        ind_map = df[self.industry_col].groupby(level="instrument").last()
+        # Determine instrument level robustly
+        idx_names_df = list(df.index.names) if isinstance(df.index, pd.MultiIndex) else []
+        if "instrument" in idx_names_df:
+            inst_level_df = idx_names_df.index("instrument")
+        else:
+            inst_level_df = (df.index.nlevels - 1) if isinstance(df.index, pd.MultiIndex) else 0
+        ind_map = df[self.industry_col].groupby(level=inst_level_df).last()
         ind_map = ind_map.dropna().astype(str)
         if ind_map.empty:
             return df
-
-        # Ensure index/column names for stable stacking/join
-        rets.index.name = "datetime"
-        rets.columns.name = "instrument"
-        if mcap is not None:
-            mcap.index.name = "datetime"
-            mcap.columns.name = "instrument"
 
         common_cols = ind_map.index.intersection(rets.columns)
         if len(common_cols) == 0:
@@ -714,12 +725,14 @@ class IndustryMomentumProcessor(Processor):
             logger.info(f"INDMOM out_series non-null={int(out_df[self.out_col].notna().sum())}")
         except Exception:
             pass
-        # Join by MultiIndex to avoid reindex pitfalls
-        try:
-            df = df.drop(columns=[self.out_col], errors='ignore')
-        except Exception:
-            pass
-        df = df.join(out_df, how='left')
+        # Assign via reindex on values (robust to index name mismatches)
+        series = out_df[self.out_col]
+        desired_names = list(df.index.names)
+        if all(n is not None for n in desired_names) and list(series.index.names) != desired_names:
+            series = series.reorder_levels(desired_names).sort_index()
+        df = df.copy()
+        df[self.out_col] = series.reindex(df.index)
+
         logger.info("IndustryMomentumProcessor finished...")
         return df
 
