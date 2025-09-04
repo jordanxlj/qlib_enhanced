@@ -253,7 +253,7 @@ class FundamentalProfileProcessor(Processor):
             idx_pos = np.clip(idx_pos, 0, len(trade_dates) - 1)
             eff_index = trade_dates[idx_pos]
             ts.index = eff_index
-            # Drop duplicate announcement dates per ticker, keep the latest record
+            # Drop duplicate effective dates per ticker, keep the latest record
             if ts.index.has_duplicates:
                 ts = ts[~ts.index.duplicated(keep="last")]
             ts = ts.sort_index()  # Ensure monotonic after drop
@@ -634,6 +634,13 @@ class IndustryMomentumProcessor(Processor):
         if ind_map.empty:
             return df
 
+        # Ensure index/column names for stable stacking/join
+        rets.index.name = "datetime"
+        rets.columns.name = "instrument"
+        if mcap is not None:
+            mcap.index.name = "datetime"
+            mcap.columns.name = "instrument"
+
         common_cols = ind_map.index.intersection(rets.columns)
         if len(common_cols) == 0:
             return df
@@ -650,8 +657,13 @@ class IndustryMomentumProcessor(Processor):
             rs_col = convolve(log1p[:, j], w_flip, mode='valid')
             rs_np[self.window - 1 :, j] = rs_col.astype(np.float32)
         rs_df = pd.DataFrame(rs_np, index=rets.index, columns=rets.columns)
+        try:
+            logger.info(f"INDMOM rs_df non-null={int(rs_df.notna().sum().sum())}")
+        except Exception:
+            pass
 
-        # Weights proportional to sqrt(market cap)
+        # Weights proportional to sqrt(market cap); ffill to avoid NaNs on missing days
+        mcap = mcap.replace([np.inf, -np.inf], np.nan).ffill()
         w_raw = np.sqrt(mcap.clip(lower=0)).replace([np.inf, -np.inf], np.nan)
         w_sum = w_raw.sum(axis=1).replace(0, np.nan)
         w_norm = w_raw.div(w_sum, axis=0)
@@ -662,8 +674,16 @@ class IndustryMomentumProcessor(Processor):
         for ind, cols in ind_to_cols.items():
             if not cols:
                 continue
-            w_ind = w_norm[cols].div(w_norm[cols].sum(axis=1), axis=0)
+            w_ind = w_norm[cols]
+            den = w_ind.sum(axis=1)
+            w_ind = w_ind.div(den.replace(0, np.nan), axis=0)
+            if len(cols) > 0:
+                w_ind = w_ind.fillna(1.0 / float(len(cols)))
             industry_rs_df[ind] = (rs_df[cols] * w_ind).sum(axis=1)
+        try:
+            logger.info(f"INDMOM industry_rs non-null={int(industry_rs_df.notna().sum().sum())}")
+        except Exception:
+            pass
 
         # Map per-instrument industry RS
         ind_map_aligned = ind_map.reindex(common_cols)
@@ -672,13 +692,34 @@ class IndustryMomentumProcessor(Processor):
         # Normalize weights within industry daily
         c_norm = pd.DataFrame(index=rs_df.index, columns=common_cols, dtype=float)
         for ind, cols in ind_to_cols.items():
-            w_ind = w_raw[cols].div(w_raw[cols].sum(axis=1), axis=0)
+            w_ind = w_raw[cols]
+            den = w_ind.sum(axis=1)
+            w_ind = w_ind.div(den.replace(0, np.nan), axis=0)
+            if len(cols) > 0:
+                w_ind = w_ind.fillna(1.0 / float(len(cols)))
             c_norm[cols] = w_ind
 
         indmom = rs_ind_for_inst - c_norm * rs_df
+        try:
+            nn_indmom = int((~(indmom.isna())).sum().sum())
+            logger.info(f"INDMOM indmom non-null={nn_indmom}")
+        except Exception:
+            pass
 
+        indmom.columns.name = "instrument"
+        indmom.index.name = "datetime"
         indmom_long = indmom.stack().rename(self.out_col)
-        df = df.assign(**{self.out_col: indmom_long.reindex(df.index).astype(float)})
+        out_df = indmom_long.astype(float).to_frame(self.out_col)
+        try:
+            logger.info(f"INDMOM out_series non-null={int(out_df[self.out_col].notna().sum())}")
+        except Exception:
+            pass
+        # Join by MultiIndex to avoid reindex pitfalls
+        try:
+            df = df.drop(columns=[self.out_col], errors='ignore')
+        except Exception:
+            pass
+        df = df.join(out_df, how='left')
         logger.info("IndustryMomentumProcessor finished...")
         return df
 
