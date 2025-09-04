@@ -166,7 +166,7 @@ class FundamentalProfileProcessor(Processor):
     - Values are valid from current ann_date until next ann_date for the same ticker.
     """
 
-    def __init__(self, csv_path: str = "data/others/cn_profile.csv", prefix: str = "F_", date_col: str = "ann_date"):
+    def __init__(self, csv_path: str = "data/others/cn_profile.csv", prefix: str = "", date_col: str = "ann_date"):
         super().__init__()
         self.csv_path = csv_path
         self.prefix = prefix
@@ -337,18 +337,18 @@ class FundamentalProfileProcessor(Processor):
             td = td_fallback.mask(both_nan, np.nan)
 
         derived = {
-            "F_LD": ld,
-            "F_TD": td,
-            "F_BE": be,
-            "F_TL": tl,
-            "F_TA": ta,
-            "F_SALES": sales,
-            "F_COGS": cogs,
-            "F_EARNINGS": earnings,
-            "F_CASH": cash,
-            "F_CFO": cfo,
-            "F_CFI": cfi,
-            "F_DA": da,
+            "LD": ld,
+            "TD": td,
+            "BE": be,
+            "TL": tl,
+            "TA": ta,
+            "SALES": sales,
+            "COGS": cogs,
+            "EARNINGS": earnings,
+            "CASH": cash,
+            "CFO": cfo,
+            "CFI": cfi,
+            "DA": da,
         }
         assign_map = {}
         for out, ser in derived.items():
@@ -364,10 +364,10 @@ class FundamentalProfileProcessor(Processor):
         get = lambda c: merged.get(c, pd.Series(index=merged.index, dtype=float))
         me = get("market_cap")
         if "$market_cap" in df.columns:
-            df["F_ME"] = df["$market_cap"].astype(float)
+            df["ME"] = df["$market_cap"].astype(float)
         elif not me.empty:
             me = me.groupby(level=1).ffill()
-            df["F_ME"] = me.reindex(df.index).astype(float)
+            df["ME"] = me.reindex(df.index).astype(float)
         return df
 
     def _assign_ratios(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
@@ -456,20 +456,20 @@ class BarraFundamentalQualityProcessor(Processor):
             return val.replace([np.inf, -np.inf], np.nan)
 
         # Basic components
-        ME = col("F_ME").astype(float)
-        PE = col("F_PE").astype(float).fillna(0.0)
-        LD = col("F_LD").astype(float).fillna(0.0)
-        BE = col("F_BE").astype(float)
-        TL = col("F_TL").astype(float)
-        TA = col("F_TA").astype(float)
-        SALES = col("F_SALES").astype(float)
-        COGS = col("F_COGS").astype(float)
-        EARN = col("F_EARNINGS").astype(float)
-        CASH = col("F_CASH").astype(float).fillna(0.0)
-        TD = col("F_TD").astype(float).fillna(0.0)
-        CFO = col("F_CFO").astype(float).fillna(0.0)
-        CFI = col("F_CFI").astype(float).fillna(0.0)
-        DA = col("F_DA").astype(float).fillna(0.0)
+        ME = col("ME").astype(float)
+        PE = col("PE").astype(float).fillna(0.0)
+        LD = col("LD").astype(float).fillna(0.0)
+        BE = col("BE").astype(float)
+        TL = col("TL").astype(float)
+        TA = col("TA").astype(float)
+        SALES = col("SALES").astype(float)
+        COGS = col("COGS").astype(float)
+        EARN = col("EARNINGS").astype(float)
+        CASH = col("CASH").astype(float).fillna(0.0)
+        TD = col("TD").astype(float).fillna(0.0)
+        CFO = col("CFO").astype(float).fillna(0.0)
+        CFI = col("CFI").astype(float).fillna(0.0)
+        DA = col("DA").astype(float).fillna(0.0)
 
         # Prefer ratio columns if available
         q_assign = {}
@@ -531,7 +531,7 @@ class IndustryProcessor(Processor):
     - Values are static per ticker and will be attached to every date row.
     """
 
-    def __init__(self, csv_path: str = "data/others/cn_company_facts.csv", prefix: str = "F_", code_col: str = "industry_code", name_col: str = "industry"):
+    def __init__(self, csv_path: str = "data/others/cn_company_facts.csv", prefix: str = "", code_col: str = "industry_code", name_col: str = "industry"):
         super().__init__()
         self.csv_path = csv_path
         self.prefix = prefix
@@ -621,7 +621,7 @@ class IndustryMomentumProcessor(Processor):
         return_col: str = "$return",
         close_col: str = "$close",
         mcap_col: str = "$market_cap",
-        industry_col: str = "F_INDUSTRY_CODE",
+        industry_col: str = "INDUSTRY_CODE",
         window: int = 126,
         halflife: int = 21,
         out_col: str = "B_INDMOM",
@@ -787,28 +787,75 @@ def compute_beta_resvol(
     beta_win: int = 252,
     resvol_win: int = 252,
     halflife_beta: int = 63,
+    *,
+    return_ts: bool = False,
+    method: str = "ewm",
+    min_periods: int = 30,
 ) -> Tuple[pd.Series, pd.Series]:
+    """Compute CAPM beta and residual volatility.
+
+    When return_ts is False (default), returns cross-sectional snapshot Series (index: instruments).
+    When return_ts is True, returns time series DataFrames (index: datetime, columns: instruments).
+
+    method: 'ewm' (exponentially weighted with halflife) or 'rolling' (simple rolling window).
+    """
     if returns.empty or market_returns.empty:
+        if return_ts:
+            return pd.DataFrame(), pd.DataFrame()
         return pd.Series(dtype=float), pd.Series(dtype=float)
-    win = max(beta_win, resvol_win)
-    rets_win = returns.iloc[-win:].fillna(0.0)
-    mkt_win = market_returns.iloc[-win:].fillna(0.0)
-    weights = np.exp(-np.log(2) * np.arange(win) / max(halflife_beta, 1))[::-1]
-    weights /= weights.sum()
-    rets_mean_w = rets_win.T.dot(weights)
-    rets_center = rets_win - rets_mean_w
-    mkt_mean_w = mkt_win.dot(weights)
-    mkt_center = mkt_win - mkt_mean_w
-    var_m = mkt_center.dot(weights * mkt_center)
-    if var_m <= 0:
-        zero = pd.Series(0.0, index=returns.columns)
-        return zero, zero
-    cov = rets_center.multiply(weights * mkt_center, axis=0).sum(axis=0)
-    beta = cov / var_m
-    fitted = pd.DataFrame(np.outer(mkt_win, beta), index=rets_win.index, columns=rets_win.columns)
-    resid = rets_win - fitted
-    resvol = resid.std()
-    return beta, resvol
+
+    rets = returns.sort_index().astype(float)
+    mkt = market_returns.sort_index().astype(float)
+    rets = rets.reindex(index=mkt.index).fillna(0.0)
+    mkt = mkt.fillna(0.0)
+
+    if not return_ts:
+        win = max(beta_win, resvol_win)
+        rets_win = rets.iloc[-win:]
+        mkt_win = mkt.iloc[-win:]
+        weights = np.exp(-np.log(2) * np.arange(win) / max(halflife_beta, 1))[::-1]
+        weights /= weights.sum()
+        rets_mean_w = rets_win.T.dot(weights)
+        rets_center = rets_win - rets_mean_w
+        mkt_mean_w = mkt_win.dot(weights)
+        mkt_center = mkt_win - mkt_mean_w
+        var_m = mkt_center.dot(weights * mkt_center)
+        if var_m <= 0:
+            zero = pd.Series(0.0, index=rets.columns)
+            return zero, zero
+        cov = rets_center.multiply(weights * mkt_center, axis=0).sum(axis=0)
+        beta = cov / var_m
+        fitted = pd.DataFrame(np.outer(mkt_win, beta), index=rets_win.index, columns=rets_win.columns)
+        resid = rets_win - fitted
+        resvol = resid.std()
+        return beta, resvol
+
+    # Time series mode
+    beta_ts = pd.DataFrame(index=rets.index, columns=rets.columns, dtype=float)
+    resvol_ts = pd.DataFrame(index=rets.index, columns=rets.columns, dtype=float)
+
+    if method == "ewm":
+        mkt_var = mkt.ewm(halflife=halflife_beta, min_periods=min_periods, adjust=False).var()
+        mkt_var = mkt_var.replace(0.0, np.nan)
+        for col in rets.columns:
+            cov = rets[col].ewm(halflife=halflife_beta, min_periods=min_periods, adjust=False).cov(mkt)
+            beta_col = cov / mkt_var
+            beta_ts[col] = beta_col
+            resid = rets[col] - beta_col * mkt
+            resvol_ts[col] = resid.ewm(halflife=resvol_win // 3 if resvol_win else halflife_beta, min_periods=min_periods, adjust=False).std(bias=False)
+    else:
+        # simple rolling window
+        for col in rets.columns:
+            cov = rets[col].rolling(beta_win, min_periods=min_periods).cov(mkt)
+            var = mkt.rolling(beta_win, min_periods=min_periods).var()
+            beta_col = cov / var.replace(0.0, np.nan)
+            beta_ts[col] = beta_col
+            resid = rets[col] - beta_col * mkt
+            resvol_ts[col] = resid.rolling(resvol_win, min_periods=min_periods).std()
+
+    beta_ts = beta_ts.replace([np.inf, -np.inf], np.nan)
+    resvol_ts = resvol_ts.replace([np.inf, -np.inf], np.nan)
+    return beta_ts, resvol_ts
 
 
 def compute_volatility(
@@ -880,7 +927,12 @@ def compute_cne6_exposures(
 
     size = compute_size(caps.iloc[-1])
     mom = compute_momentum(rets, mom_win=lb["mom"], gap=lb["mom_gap"])
-    beta, resvol = compute_beta_resvol(rets, mkt, beta_win=lb["beta"], resvol_win=lb["resvol"])
+    # Dynamic beta/resvol time series; attach last snapshot for exposures
+    beta_ts, resvol_ts = compute_beta_resvol(
+        rets, mkt, beta_win=lb["beta"], resvol_win=lb["resvol"], halflife_beta=63, return_ts=True, method="rolling"
+    )
+    beta = beta_ts.iloc[-1] if isinstance(beta_ts, pd.DataFrame) and not beta_ts.empty else pd.Series(0.0, index=rets.columns)
+    resvol = resvol_ts.iloc[-1] if isinstance(resvol_ts, pd.DataFrame) and not resvol_ts.empty else pd.Series(0.0, index=rets.columns)
     vol = compute_volatility(rets, mkt, win=lb["vol_win"])
     liq = compute_liquidity(turnover) if turnover is not None else pd.Series(0.0, index=rets.columns)
     if eps_trailing is not None and price is not None:
@@ -899,6 +951,126 @@ def compute_cne6_exposures(
     exposures = exposures.replace([np.inf, -np.inf], 0.0).fillna(0.0)
     return exposures
 
+
+def compute_cne6_exposures_ts(
+    returns: pd.DataFrame,
+    mcap: pd.DataFrame,
+    market_returns: pd.Series,
+    turnover: Optional[pd.DataFrame] = None,
+    eps_trailing: Optional[pd.DataFrame] = None,
+    eps_pred: Optional[pd.DataFrame] = None,
+    price: Optional[pd.DataFrame] = None,
+    *,
+    lookbacks: Optional[Dict[str, int]] = None,
+    method_beta: str = "rolling",
+    halflife_beta: int = 63,
+) -> Dict[str, pd.DataFrame]:
+    """Compute daily time series exposures for CNE6 factors.
+
+    Returns a dict of DataFrames keyed by factor name (e.g., 'SIZE','BETA','MOM','RESVOL','VOL','LIQ','EY').
+    Each DataFrame is indexed by datetime and has instruments as columns.
+    """
+    if returns.empty:
+        return {}
+    if mcap.empty:
+        raise ValueError("mcap is required and must align with returns")
+    if market_returns.empty:
+        raise ValueError("market_returns is required and must align with returns")
+
+    lb = {"beta": 252, "resvol": 252, "mom": 504, "mom_gap": 21, "vol_win": 252}
+    if lookbacks is not None:
+        lb.update({k: int(v) for k, v in lookbacks.items() if k in lb})
+
+    rets = returns.sort_index().copy()
+    caps = mcap.reindex_like(rets)
+    mkt = market_returns.reindex(rets.index).fillna(0.0)
+
+    out: Dict[str, pd.DataFrame] = {}
+
+    # SIZE: -log(ME) daily
+    size_ts = -_safe_log(caps)
+    out["SIZE"] = size_ts
+
+    # MOM: weighted rolling of log(1+r), then shift by gap
+    weights = np.exp(-np.log(2) * np.arange(lb["mom"]) / max(lb.get("halflife_mom", lb["mom"] // 4), 1))[::-1]
+    weights /= weights.sum()
+    log1p = np.log1p(rets.fillna(0.0)).to_numpy()
+    mom_np = np.full(log1p.shape, np.nan, dtype=np.float32)
+    w_flip = weights[::-1].astype(np.float32)
+    for j in range(log1p.shape[1]):
+        comp = np.convolve(log1p[:, j], w_flip, mode='valid')
+        # place from mom_win-1 onward
+        mom_np[lb["mom"] - 1 :, j] = comp.astype(np.float32)
+    mom_df = pd.DataFrame(mom_np, index=rets.index, columns=rets.columns)
+    mom_df = mom_df.shift(lb["mom_gap"])  # apply gap
+    out["MOM"] = mom_df
+
+    # Beta & ResVol time series
+    beta_ts, resvol_ts = compute_beta_resvol(
+        rets, mkt, beta_win=lb["beta"], resvol_win=lb["resvol"], halflife_beta=halflife_beta, return_ts=True, method=method_beta
+    )
+    out["BETA"] = beta_ts
+    out["RESVOL"] = resvol_ts
+
+    # VOL time series
+    # DASTD
+    win = lb["vol_win"]
+    w_vol = np.exp(-np.log(2) * np.arange(win) / max(int(win // 6) or 1, 1))[::-1]
+    w_vol /= w_vol.sum()
+    def _dastd_col(x: np.ndarray) -> float:
+        return float(np.sqrt(np.nansum(w_vol * np.square(np.nan_to_num(x)))))
+    dastd_ts = rets.rolling(win).apply(_dastd_col, raw=True)
+    # CMRA approximated as rolling range of cumulative log returns
+    cmra_window = min(win, 252)
+    cum_log_ret = np.log1p(rets).cumsum()
+    cmra_ts = cum_log_ret.rolling(cmra_window).apply(lambda a: float(np.nanmax(a) - np.nanmin(a)), raw=True)
+    # Use ResVol as HSIGMA component
+    hsigma_ts = resvol_ts.reindex_like(rets)
+    vol_ts = 0.74 * dastd_ts + 0.16 * cmra_ts + 0.10 * hsigma_ts
+    out["VOL"] = vol_ts
+
+    # LIQ family time series: STOM/STOQ/STOA/ATVR, normalized by market cap when available
+    if turnover is not None and not turnover.empty:
+        # Normalize turnover by market cap when provided
+        if mcap is not None and not mcap.empty:
+            share_turn = (turnover / mcap.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan)
+        else:
+            share_turn = turnover.copy()
+        stom = np.log(share_turn.rolling(21).mean() + 1e-6)
+        stoq = np.log(share_turn.rolling(63).mean() + 1e-6)
+        stoa = np.log(share_turn.rolling(252).mean() + 1e-6)
+        out["STOM"] = stom
+        out["STOQ"] = stoq
+        out["STOA"] = stoa
+        # ATVR: prefer turnover rate if likely in [0,1], else fall back to share_turn
+        med = float(np.nanmedian(turnover.to_numpy())) if turnover.size else np.nan
+        if not np.isnan(med) and med <= 1.0:
+            turnover_rate = turnover
+        else:
+            turnover_rate = share_turn
+        atvr = turnover_rate.ewm(halflife=63, min_periods=30, adjust=False).mean() * 252.0
+        out["ATVR"] = atvr
+        # Composite LIQ
+        liq_ts = 0.35 * stom + 0.35 * stoq + 0.30 * stoa
+        out["LIQ"] = liq_ts
+
+    # EY time series
+    if eps_trailing is not None and price is not None:
+        eps_tr_ts = eps_trailing.reindex_like(price).astype(float)
+        eps_pr_ts = eps_pred.reindex_like(price).astype(float) if eps_pred is not None else pd.DataFrame(0.0, index=price.index, columns=price.columns)
+        price_ts = price.astype(float).replace(0.0, np.nan)
+        ep_trail = eps_tr_ts / price_ts
+        ep_pred = eps_pr_ts / price_ts
+        ey_ts = 0.5 * ep_trail + 0.5 * ep_pred
+        out["EY"] = ey_ts
+
+    # Clean up infinities
+    for k, df_ts in list(out.items()):
+        if df_ts is None or df_ts.empty:
+            continue
+        out[k] = df_ts.replace([np.inf, -np.inf], np.nan)
+
+    return out
 
 class BarraFactorProcessor(Processor):
     """End-to-end processor to attach F_/Q_/Industry/CNE6/B_INDMOM in one pass.
@@ -970,7 +1142,7 @@ class BarraFactorProcessor(Processor):
         assert isinstance(df.index, pd.MultiIndex) and df.index.nlevels == 2, "Input df must be MultiIndex (datetime, instrument)"
 
         # 1) Fundamentals
-        df = FundamentalProfileProcessor(csv_path=self.profile_csv_path, prefix=self.profile_prefix)(df)
+        df = FundamentalProfileProcessor(csv_path=self.profile_csv_path, prefix="")(df)
 
         # 2) Quality factors
         df = BarraFundamentalQualityProcessor()(df)
@@ -992,9 +1164,9 @@ class BarraFactorProcessor(Processor):
         eps_pred = _pivot_wide(df, self.eps_pred_col) if self.eps_pred_col else None
         price = _pivot_wide(df, self.price_col) if self.price_col else None
 
-        import pdb; pdb.set_trace()
         if returns is not None and mcap is not None and market_series is not None:
-            expos = compute_cne6_exposures(
+            # Compute daily time-series exposures
+            expos_ts = compute_cne6_exposures_ts(
                 returns=returns,
                 mcap=mcap,
                 market_returns=market_series,
@@ -1003,15 +1175,29 @@ class BarraFactorProcessor(Processor):
                 eps_pred=eps_pred,
                 price=price,
                 lookbacks=self.lookbacks,
+                method_beta="rolling",
+                halflife_beta=63,
             )
-            df = self._attach_exposures(df, expos)
+            # Write back each factor daily
+            for key, ts_df in expos_ts.items():
+                if ts_df is None or ts_df.empty:
+                    continue
+                ts_df.index.name = "datetime"
+                ts_df.columns.name = "instrument"
+                ser = ts_df.stack().rename(f"B_{key}")
+                if any(n is None for n in df.index.names) or list(ser.index.names) != list(df.index.names):
+                    try:
+                        ser = ser.reorder_levels(df.index.names).sort_index()
+                    except Exception:
+                        pass
+                df[f"B_{key}"] = ser.reindex(df.index)
 
         # 5) Industry momentum (robust write-back & alignment already handled inside)
         df = IndustryMomentumProcessor(
             return_col="$return",
             close_col=self.price_col,
             mcap_col="$market_cap",
-            industry_col="F_INDUSTRY_CODE",
+            industry_col="INDUSTRY_CODE",
             window=self.indmom_window,
             halflife=self.indmom_halflife,
             out_col=self.indmom_out,
