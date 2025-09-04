@@ -43,6 +43,26 @@ def trim_outliers(series: pd.Series, lower_q: float = 0.05, upper_q: float = 0.9
     return s.mask((s < ql) | (s > qh))
 
 
+def _pivot_wide(df: pd.DataFrame, col: str) -> Optional[pd.DataFrame]:
+    if col is None or col not in df.columns:
+        return None
+    ser = df[col]
+    if not isinstance(ser.index, pd.MultiIndex) or ser.index.nlevels < 2:
+        return None
+    idx_names = list(ser.index.names)
+    if "instrument" in idx_names:
+        inst_level = idx_names.index("instrument")
+    else:
+        inst_level = ser.index.nlevels - 1  # assume last level is instrument when unnamed
+    wide = ser.unstack(level=inst_level).sort_index()
+    # Normalize index/column names for stable downstream ops
+    wide.index.name = "datetime"
+    wide.columns.name = "instrument"
+    # Ensure numeric
+    wide = wide.apply(pd.to_numeric, errors="coerce").astype(np.float32)
+    return wide
+
+
 class BarraCNE6Processor(Processor):
     """Processor to compute and attach Barra-style exposures via CNE6 functions.
 
@@ -270,8 +290,12 @@ class FundamentalProfileProcessor(Processor):
         return merged
 
     def _reorder_merged_index(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
-        if list(merged.index.names) != list(df.index.names):
-            merged = merged.reorder_levels(df.index.names).sort_index()
+        # If target df index has unnamed levels, skip reordering by names
+        target_names = list(df.index.names)
+        if any(n is None for n in target_names):
+            return merged.sort_index()
+        if list(merged.index.names) != target_names:
+            merged = merged.reorder_levels(target_names).sort_index()
         return merged
 
     def _assign_factors(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
@@ -561,7 +585,16 @@ class IndustryProcessor(Processor):
         code_map = facts.set_index("ticker")[self.code_col].to_dict() if self.code_col in facts.columns else {}
         name_map = facts.set_index("ticker")[self.name_col].to_dict() if self.name_col in facts.columns else {}
 
-        inst_index = df.index.get_level_values("instrument").astype(str)
+        # Robust instrument level extraction when index names are missing
+        if isinstance(df.index, pd.MultiIndex):
+            idx_names = list(df.index.names)
+            if "instrument" in idx_names:
+                inst_level = idx_names.index("instrument")
+            else:
+                inst_level = df.index.nlevels - 1
+            inst_index = df.index.get_level_values(inst_level).astype(str)
+        else:
+            inst_index = df.index.astype(str)
         assign = {}
         if code_map:
             assign[f"{self.prefix}INDUSTRY_CODE"] = inst_index.map(code_map)
@@ -613,21 +646,7 @@ class IndustryMomentumProcessor(Processor):
         assert isinstance(df.index, pd.MultiIndex) and df.index.nlevels == 2, "Input df must be MultiIndex (datetime, instrument)"
 
         def pivot(col: str) -> Optional[pd.DataFrame]:
-            if col not in df.columns:
-                return None
-            ser = df[col]
-            if not isinstance(ser.index, pd.MultiIndex) or ser.index.nlevels < 2:
-                return None
-            idx_names = list(ser.index.names)
-            if "instrument" in idx_names:
-                inst_level = idx_names.index("instrument")
-            else:
-                inst_level = ser.index.nlevels - 1  # assume last level is instrument
-            wide = ser.unstack(level=inst_level).sort_index().astype(np.float32)
-            # Normalize index/column names for stable downstream ops
-            wide.index.name = "datetime"
-            wide.columns.name = "instrument"
-            return wide
+            return _pivot_wide(df, col)
 
         rets = pivot(self.return_col)
         if rets is None:
@@ -665,7 +684,7 @@ class IndustryMomentumProcessor(Processor):
         rs_np = np.full(log1p.shape, np.nan, dtype=np.float32)
         w_flip = weights[::-1].astype(np.float32)
         for j in range(log1p.shape[1]):
-            rs_col = convolve(log1p[:, j], w_flip, mode='valid')
+            rs_col = np.convolve(log1p[:, j], w_flip, mode='valid')
             rs_np[self.window - 1 :, j] = rs_col.astype(np.float32)
         rs_df = pd.DataFrame(rs_np, index=rets.index, columns=rets.columns)
         try:
@@ -879,3 +898,125 @@ def compute_cne6_exposures(
     exposures = exposures.apply(lambda s: (s - s.mean()) / s.std(ddof=0) if s.std(ddof=0) > 0 else s)
     exposures = exposures.replace([np.inf, -np.inf], 0.0).fillna(0.0)
     return exposures
+
+
+class BarraFactorProcessor(Processor):
+    """End-to-end processor to attach F_/Q_/Industry/CNE6/B_INDMOM in one pass.
+
+    - Reuses FundamentalProfileProcessor, BarraFundamentalQualityProcessor, IndustryProcessor
+    - Uses compute_cne6_exposures with robust wide pivot via _pivot_wide
+    - Computes industry momentum via IndustryMomentumProcessor (robust write-back)
+    """
+
+    def __init__(
+        self,
+        *,
+        profile_csv_path: str = "data/others/cn_profile.csv",
+        facts_csv_path: str = "data/others/cn_company_facts.csv",
+        profile_prefix: str = "F_",
+        market_col: str = "$market_ret",
+        turnover_col: str = "$turnover",
+        eps_trailing_col: Optional[str] = None,
+        eps_pred_col: Optional[str] = None,
+        price_col: str = "$close",
+        lookbacks: Optional[Dict[str, int]] = None,
+        indmom_window: int = 126,
+        indmom_halflife: int = 21,
+        indmom_out: str = "B_INDMOM",
+        debug: bool = False,
+    ):
+        super().__init__()
+        self.profile_csv_path = profile_csv_path
+        self.facts_csv_path = facts_csv_path
+        self.profile_prefix = profile_prefix
+        self.market_col = market_col
+        self.turnover_col = turnover_col
+        self.eps_trailing_col = eps_trailing_col
+        self.eps_pred_col = eps_pred_col
+        self.price_col = price_col
+        self.lookbacks = lookbacks or {}
+        self.indmom_window = int(indmom_window)
+        self.indmom_halflife = int(indmom_halflife)
+        self.indmom_out = indmom_out
+        self.debug = debug
+
+    def fit(self, df: pd.DataFrame):
+        return self
+
+    def _attach_exposures(self, df: pd.DataFrame, expos: pd.DataFrame) -> pd.DataFrame:
+        if expos is None or expos.empty:
+            return df
+        # Robust instrument level extraction when index names are missing
+        if isinstance(df.index, pd.MultiIndex):
+            idx_names = list(df.index.names)
+            if "instrument" in idx_names:
+                inst_level = idx_names.index("instrument")
+            else:
+                inst_level = df.index.nlevels - 1
+            inst_index = df.index.get_level_values(inst_level)
+        else:
+            inst_index = df.index
+        assign = {}
+        for col in expos.columns:
+            mapping = expos[col]
+            assign[f"B_{col}"] = inst_index.map(mapping).astype(float)
+        if assign:
+            df = df.assign(**assign)
+        return df
+
+    def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return df
+        assert isinstance(df.index, pd.MultiIndex) and df.index.nlevels == 2, "Input df must be MultiIndex (datetime, instrument)"
+
+        # 1) Fundamentals
+        df = FundamentalProfileProcessor(csv_path=self.profile_csv_path, prefix=self.profile_prefix)(df)
+
+        # 2) Quality factors
+        df = BarraFundamentalQualityProcessor()(df)
+
+        # 3) Industry mapping
+        df = IndustryProcessor(csv_path=self.facts_csv_path)(df)
+
+        # 4) CNE6 exposures (robust pivot)
+        returns = _pivot_wide(df, "$return")
+        if returns is None:
+            close = _pivot_wide(df, self.price_col)
+            if close is not None:
+                returns = close.pct_change()
+        mcap = _pivot_wide(df, "$market_cap")
+        market = _pivot_wide(df, self.market_col)
+        market_series = market.iloc[:, 0] if market is not None else None
+        turnover = _pivot_wide(df, self.turnover_col) if self.turnover_col else None
+        eps_trailing = _pivot_wide(df, self.eps_trailing_col) if self.eps_trailing_col else None
+        eps_pred = _pivot_wide(df, self.eps_pred_col) if self.eps_pred_col else None
+        price = _pivot_wide(df, self.price_col) if self.price_col else None
+
+        import pdb; pdb.set_trace()
+        if returns is not None and mcap is not None and market_series is not None:
+            expos = compute_cne6_exposures(
+                returns=returns,
+                mcap=mcap,
+                market_returns=market_series,
+                turnover=turnover,
+                eps_trailing=eps_trailing,
+                eps_pred=eps_pred,
+                price=price,
+                lookbacks=self.lookbacks,
+            )
+            df = self._attach_exposures(df, expos)
+
+        # 5) Industry momentum (robust write-back & alignment already handled inside)
+        df = IndustryMomentumProcessor(
+            return_col="$return",
+            close_col=self.price_col,
+            mcap_col="$market_cap",
+            industry_col="F_INDUSTRY_CODE",
+            window=self.indmom_window,
+            halflife=self.indmom_halflife,
+            out_col=self.indmom_out,
+            debug=self.debug,
+        )(df)
+
+        logger.info("BarraFactorProcessor finished.")
+        return df

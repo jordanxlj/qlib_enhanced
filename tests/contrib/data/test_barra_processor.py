@@ -328,3 +328,88 @@ def test_industry_momentum_index_column_name_robustness():
     if not out3["B_INDMOM"].notna().any():
         print("All NaN in swapped case; non-null:", out3["B_INDMOM"].notna().sum())
     assert out3["B_INDMOM"].notna().any()
+
+
+def _make_facts_csv(tmp_path, instruments):
+    # instruments like SH600000 -> 600000.SH
+    rows = []
+    for inst in instruments:
+        exch, code = inst[:2], inst[2:]
+        rows.append({
+            "ticker": f"{code}.{exch}",
+            "industry_code": "BANK" if inst != instruments[-1] else "TECH",
+            "industry": "Bank" if inst != instruments[-1] else "Tech",
+        })
+    p = tmp_path / "cn_facts.csv"
+    pd.DataFrame(rows).to_csv(p, index=False)
+    return str(p)
+
+
+def test_barra_factor_processor_basic(tmp_path):
+    dates = pd.bdate_range("2024-01-01", periods=12)
+    instruments = ["SH600000", "SZ000001", "SZ000002"]
+    df = _make_multiindex_frame(dates, instruments)
+    # Ensure market cap present and stable
+    df["$market_cap"] = (df["$close"] * 1e8).astype(float)
+
+    profile_csv = _make_cn_profile_csv(tmp_path, instruments)
+    facts_csv = _make_facts_csv(tmp_path, instruments)
+
+    proc = BarraFactorProcessor(
+        profile_csv_path=profile_csv,
+        facts_csv_path=facts_csv,
+        market_col="$market_ret",
+        price_col="$close",
+        lookbacks={"beta": 5, "resvol": 5, "mom": 5, "mom_gap": 1, "vol_win": 5},
+        indmom_window=4,
+        indmom_halflife=2,
+        debug=False,
+    )
+    out = proc(df.copy())
+
+    # Check fundamentals / quality / industry
+    assert "F_ROE_RATIO" in out.columns or "F_RETURN_ON_EQUITY" in out.columns
+    for col in ["Q_MLEV", "Q_DTOA", "Q_ROA"]:
+        assert col in out.columns and out[col].notna().any()
+    assert "F_INDUSTRY_CODE" in out.columns and out["F_INDUSTRY_CODE"].notna().any()
+
+    # Check CNE6 exposures
+    for col in ["B_SIZE", "B_BETA", "B_MOM", "B_RESVOL"]:
+        assert col in out.columns and out[col].notna().any()
+
+    # Check industry momentum
+    assert "B_INDMOM" in out.columns and out["B_INDMOM"].notna().any()
+
+
+def test_barra_factor_processor_index_column_name_robustness(tmp_path):
+    dates = pd.bdate_range("2024-01-01", periods=12)
+    instruments = ["SH600000", "SZ000001", "SZ000002"]
+    df = _make_multiindex_frame(dates, instruments)
+    df["$market_cap"] = (df["$close"] * 1e8).astype(float)
+
+    profile_csv = _make_cn_profile_csv(tmp_path, instruments)
+    facts_csv = _make_facts_csv(tmp_path, instruments)
+
+    proc = BarraFactorProcessor(
+        profile_csv_path=profile_csv,
+        facts_csv_path=facts_csv,
+        market_col="$market_ret",
+        price_col="$close",
+        lookbacks={"beta": 5, "resvol": 5, "mom": 5, "mom_gap": 1, "vol_win": 5},
+        indmom_window=4,
+        indmom_halflife=2,
+        debug=False,
+    )
+
+    # Case A: drop index names
+    df2 = df.copy()
+    df2.index = df2.index.set_names([None, None])
+    out2 = proc(df2)
+    assert out2["B_INDMOM"].notna().any()
+
+    # Case B: swap levels
+    df3 = df.copy()
+    df3.index = df3.index.reorder_levels(["instrument", "datetime"])
+    df3 = df3.sort_index()
+    out3 = proc(df3)
+    assert out3["B_INDMOM"].notna().any()
