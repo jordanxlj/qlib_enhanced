@@ -119,32 +119,6 @@ def test_fundamental_profile_and_quality(tmp_path):
         assert df2[col].notna().any()
 
 
-def test_barra_cne6_exposures_small_window():
-    dates = pd.bdate_range("2024-01-01", periods=30)
-    instruments = ["SH600000", "SZ000001"]
-    df = _make_multiindex_frame(dates, instruments)
-
-    proc = BarraCNE6Processor(market_col="$market_ret", lookbacks={"beta": 5, "resvol": 5, "mom": 5, "mom_gap": 1, "vol_win": 5})
-    out = proc(df.copy())
-    # Ensure exposure columns exist and have values
-    for col in ["B_SIZE", "B_BETA", "B_MOM", "B_RESVOL", "B_VOL"]:
-        assert col in out.columns
-        assert out[col].notna().any()
-
-
-def test_exposures_when_only_close_present():
-    # remove $return to force processor to derive returns from $close
-    dates = pd.bdate_range("2024-01-01", periods=40)
-    instruments = ["SH600000", "SZ000001"]
-    df = _make_multiindex_frame(dates, instruments)
-    df = df.drop(columns=["$return"])  # only $close, $market_cap, $market_ret remain
-
-    proc = BarraCNE6Processor(market_col="$market_ret", lookbacks={"beta": 5, "resvol": 5, "mom": 5, "mom_gap": 1, "vol_win": 5})
-    out = proc(df.copy())
-    for col in ["B_SIZE", "B_BETA", "B_MOM", "B_RESVOL", "B_VOL"]:
-        assert col in out.columns
-        assert out[col].notna().any()
-
 
 def test_missing_roe_column(tmp_path):
     dates = pd.bdate_range("2024-01-01", periods=5)
@@ -453,3 +427,111 @@ def test_compute_cne6_exposures_ts_basic():
         tail_row = expos_ts[key].loc[tail_idx]
         assert tail_row.notna().any(), f"{key} all NaN at tail"
     # Windows require full lengths; STOM (21), STOQ (63), STOA (252). On 40 days data, STOQ/STOA may be all NaN at tail.
+
+
+def test_strev_and_season_exposures_ts_long_horizon():
+    # Long horizon so SEASON (5y same-month avg) has data
+    dates = pd.bdate_range("2010-01-01", "2018-12-31")
+    instruments = ["SH600000", "SZ000001", "SH600519"]
+
+    rng = np.random.RandomState(0)
+    rets = pd.DataFrame(rng.normal(0.0, 0.01, size=(len(dates), len(instruments))), index=dates, columns=instruments)
+    price = (1.0 + rets).cumprod() * 100.0
+
+    rng2 = np.random.RandomState(1)
+    mcap = pd.DataFrame(1e9 + 1e8 * rng2.rand(len(dates), len(instruments)), index=dates, columns=instruments)
+
+    rng3 = np.random.RandomState(2)
+    mkt = pd.Series(rng3.normal(0.0, 0.008, size=len(dates)), index=dates)
+
+    expos_ts = compute_cne6_exposures_ts(
+        returns=rets,
+        mcap=mcap,
+        market_returns=mkt,
+        price=price,
+        lookbacks={"mom": 252, "mom_gap": 21, "vol_win": 252, "resvol": 252, "beta": 252},
+    )
+
+    assert "STREV" in expos_ts and isinstance(expos_ts["STREV"], pd.DataFrame)
+    assert "SEASON" in expos_ts and isinstance(expos_ts["SEASON"], pd.DataFrame)
+
+    strev = expos_ts["STREV"]
+    season = expos_ts["SEASON"]
+
+    # Alignment
+    assert list(strev.index) == list(dates)
+    assert list(season.index) == list(dates)
+    assert list(strev.columns) == instruments
+    assert list(season.columns) == instruments
+
+    # STREV warm-up (first 20 days NaN), later some values
+    assert strev.iloc[:20].isna().all().all()
+    assert strev.iloc[30:].notna().any().any()
+
+    # SEASON should have some non-null in the last year
+    last_year = season.loc[season.index >= (season.index.max() - pd.Timedelta(days=365))]
+    assert last_year.notna().any().any()
+
+
+def test_strev_exactness_small_series():
+    # Constant returns: STREV after warm-up equals the constant (weights sum to 1)
+    dates = pd.bdate_range("2024-01-01", periods=40)
+    instruments = ["SH600000"]
+    r = 0.01
+    rets = pd.DataFrame(r, index=dates, columns=instruments)
+    mcap = pd.DataFrame(1e9, index=dates, columns=instruments)
+    mkt = pd.Series(0.0, index=dates)
+
+    expos_ts = compute_cne6_exposures_ts(
+        returns=rets,
+        mcap=mcap,
+        market_returns=mkt,
+    )
+    strev = expos_ts["STREV"][instruments[0]]
+    # After 21-day warm-up, STREV should equal ~0.01
+    tail_val = float(strev.iloc[-1])
+    assert np.isfinite(tail_val)
+    assert abs(tail_val - r) < 1e-9
+
+
+def test_momentum_exactness_with_gap():
+    # Constant returns -> MOM equals log1p(r) after warm-up and shifted by gap
+    dates = pd.bdate_range("2024-01-01", periods=30)
+    instruments = ["SH600000"]
+    r = 0.005
+    rets = pd.DataFrame(r, index=dates, columns=instruments)
+    mcap = pd.DataFrame(1e9, index=dates, columns=instruments)
+    mkt = pd.Series(0.0, index=dates)
+
+    expos_ts = compute_cne6_exposures_ts(
+        returns=rets,
+        mcap=mcap,
+        market_returns=mkt,
+        lookbacks={"mom": 5, "mom_gap": 2, "halflife_mom": 2},
+    )
+    mom = expos_ts["MOM"][instruments[0]]
+    # pick a position far enough after warm-up+gap
+    expected = np.log1p(r)
+    assert abs(float(mom.iloc[-1]) - expected) < 1e-9
+
+
+def test_beta_resvol_identity_market():
+    # Each stock identical to market -> beta˜1, resvol˜0 on tail
+    dates = pd.bdate_range("2024-01-01", periods=40)
+    instruments = ["SH600000", "SZ000001"]
+    mkt = pd.Series(np.linspace(-0.01, 0.02, len(dates)), index=dates)
+    rets = pd.DataFrame({inst: mkt.values for inst in instruments}, index=dates)
+    mcap = pd.DataFrame(1e9, index=dates, columns=instruments)
+
+    expos_ts = compute_cne6_exposures_ts(
+        returns=rets,
+        mcap=mcap,
+        market_returns=mkt,
+        lookbacks={"beta": 10, "resvol": 10, "mom": 5, "mom_gap": 1, "vol_win": 10},
+        method_beta="rolling",
+        halflife_beta=5,
+    )
+    beta_tail = expos_ts["BETA"].iloc[-1]
+    resvol_tail = expos_ts["RESVOL"].iloc[-1]
+    assert np.allclose(beta_tail.values, 1.0, atol=1e-6, rtol=0)
+    assert np.allclose(resvol_tail.values, 0.0, atol=1e-10, rtol=0)

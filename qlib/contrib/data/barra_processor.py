@@ -63,101 +63,6 @@ def _pivot_wide(df: pd.DataFrame, col: str) -> Optional[pd.DataFrame]:
     return wide
 
 
-class BarraCNE6Processor(Processor):
-    """Processor to compute and attach Barra-style exposures via CNE6 functions.
-
-    It expects the input DataFrame to be MultiIndex (datetime, instrument),
-    with columns including at least:
-      - "$return" (or precomputed returns)
-      - "$market_cap"
-      - a market returns column (default "$market_ret")
-    Optionally:
-      - turnover column
-      - EPS trailing and predicted columns
-      - price column (default "$close")
-    The processor will compute exposures on the full period and attach columns
-    "B_SIZE", "B_BETA", "B_MOM", "B_RESVOL", and when data available:
-    "B_VOL", "B_LIQ", "B_EY".
-    """
-
-    def __init__(
-        self,
-        *,
-        market_col: str = "$market_ret",
-        turnover_col: str = "$turnover",
-        eps_trailing_col: Optional[str] = None,
-        eps_pred_col: Optional[str] = None,
-        price_col: str = "$close",
-        lookbacks: Optional[Dict[str, int]] = None,
-    ):
-        super().__init__()
-        self.market_col = market_col
-        self.turnover_col = turnover_col
-        self.eps_trailing_col = eps_trailing_col
-        self.eps_pred_col = eps_pred_col
-        self.price_col = price_col
-        self.lookbacks = lookbacks or {}
-
-    def fit(self, df: pd.DataFrame):
-        return self
-
-    def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty:
-            return df
-        assert isinstance(df.index, pd.MultiIndex) and df.index.nlevels == 2, "Input df must be MultiIndex (datetime, instrument)"
-
-        def pivot(col: str) -> Optional[pd.DataFrame]:
-            if col is None or col not in df.columns:
-                return None
-            wide = df[col].unstack(level="instrument").sort_index()
-            return wide
-
-        # Required
-        returns = pivot("$return")
-        if returns is None:
-            # Try derive simple returns from close
-            close = pivot(self.price_col)
-            if close is not None:
-                returns = close.pct_change()
-        mcap = pivot("$market_cap")
-        market = pivot(self.market_col)
-        market_series = market.iloc[:, 0] if market is not None else None
-
-        # Optional
-        turnover = pivot(self.turnover_col) if self.turnover_col else None
-        eps_trailing = pivot(self.eps_trailing_col) if self.eps_trailing_col else None
-        eps_pred = pivot(self.eps_pred_col) if self.eps_pred_col else None
-        price = pivot(self.price_col) if self.price_col else None
-
-        if returns is None or mcap is None or market_series is None:
-            return df
-
-        expos = compute_cne6_exposures(
-            returns=returns,
-            mcap=mcap,
-            market_returns=market_series,
-            turnover=turnover,
-            eps_trailing=eps_trailing,
-            eps_pred=eps_pred,
-            price=price,
-            lookbacks=self.lookbacks,
-        )
-        if expos is None or expos.empty:
-            return df
-
-        # Attach back to long format
-        # Map exposures (indexed by instrument) to every row by instrument level
-        if not expos.empty:
-            inst_index = df.index.get_level_values("instrument")
-            assign = {}
-            for col in expos.columns:
-                mapping = expos[col]
-                assign[f"B_{col}"] = inst_index.map(mapping).astype(float)
-            if assign:
-                df = df.assign(**assign)
-        return df
-
-
 class FundamentalProfileProcessor(Processor):
     """Load cn_profile fundamentals and align by announcement windows.
 
@@ -760,27 +665,6 @@ def _safe_log(series: pd.Series, eps: float = 1e-12) -> pd.Series:
     return np.log(series.clip(lower=eps))
 
 
-def compute_size(mcap_last: pd.Series) -> pd.Series:
-    last_caps = mcap_last.astype(float).replace([np.inf, -np.inf], np.nan)
-    return -_safe_log(last_caps).fillna(last_caps.median())
-
-
-def compute_momentum(returns: pd.DataFrame, mom_win: int = 504, gap: int = 21, halflife: int = 126) -> pd.Series:
-    if returns.empty:
-        return pd.Series(dtype=float)
-    weights = np.exp(-np.log(2) * np.arange(mom_win) / max(halflife, 1))[::-1]
-    weights /= weights.sum()
-    log1p = np.log1p(returns.fillna(0))
-    def _weighted_sum(x: np.ndarray) -> float:
-        return float(np.nansum(weights * np.nan_to_num(x)))
-    try:
-        comp = log1p.rolling(mom_win).apply(_weighted_sum, raw=True, engine="numba")
-    except Exception:
-        comp = log1p.rolling(mom_win).apply(_weighted_sum, raw=True)
-    last = comp.shift(gap).iloc[-1]
-    return last.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-
 def compute_beta_resvol(
     returns: pd.DataFrame,
     market_returns: pd.Series,
@@ -861,104 +745,6 @@ def compute_beta_resvol(
     return beta_ts, resvol_ts
 
 
-def compute_volatility(
-    returns: pd.DataFrame,
-    market_returns: pd.Series,
-    halflife_dastd: int = 42,
-    win: int = 252,
-) -> pd.Series:
-    if returns.empty:
-        return pd.Series(dtype=float)
-    weights = np.exp(-np.log(2) * np.arange(win) / max(halflife_dastd, 1))[::-1]
-    weights /= weights.sum()
-    def _dastd_col(x: np.ndarray) -> float:
-        return np.sqrt(np.nansum(weights * np.square(np.nan_to_num(x))))
-    dastd_df = returns.rolling(win).apply(_dastd_col, raw=True)
-    dastd = dastd_df.iloc[-1]
-    cmra_window = min(win, 252)
-    cum_log_ret = np.log1p(returns).cumsum().iloc[-cmra_window:]
-    cmra = cum_log_ret.max() - cum_log_ret.min()
-    _, hsigma = compute_beta_resvol(returns, market_returns, beta_win=win, resvol_win=win)
-    vol = 0.74 * dastd + 0.16 * cmra + 0.10 * hsigma
-    return vol.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-
-def compute_liquidity(turnover: pd.DataFrame, win_month: int = 21, win_quarter: int = 63, win_annual: int = 252) -> pd.Series:
-    if turnover is None or turnover.empty:
-        return pd.Series(dtype=float)
-    stom = np.log(turnover.rolling(win_month).mean().iloc[-1] + 1e-6)
-    stoq = np.log(turnover.rolling(win_quarter).mean().iloc[-1] + 1e-6)
-    stoa = np.log(turnover.rolling(win_annual).mean().iloc[-1] + 1e-6)
-    liq = 0.35 * stom + 0.35 * stoq + 0.30 * stoa
-    return liq.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-
-def compute_earnings_yield(eps_trailing: pd.Series, eps_pred: pd.Series, price: pd.Series) -> pd.Series:
-    if eps_trailing is None or price is None:
-        return pd.Series(dtype=float)
-    ep_trail = eps_trailing.astype(float) / price.replace(0, np.nan)
-    ep_pred = (eps_pred.astype(float) / price.replace(0, np.nan)) if eps_pred is not None else pd.Series(0.0, index=ep_trail.index)
-    ey = 0.5 * ep_trail + 0.5 * ep_pred
-    return ey.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-
-def compute_cne6_exposures(
-    returns: pd.DataFrame,
-    mcap: pd.DataFrame,
-    market_returns: pd.Series,
-    turnover: Optional[pd.DataFrame] = None,
-    eps_trailing: Optional[pd.DataFrame] = None,
-    eps_pred: Optional[pd.DataFrame] = None,
-    price: Optional[pd.DataFrame] = None,
-    *,
-    lookbacks: Optional[Dict[str, int]] = None,
-) -> pd.DataFrame:
-    if returns.empty:
-        return pd.DataFrame()
-    if mcap.empty:
-        raise ValueError("mcap is required and must align with returns")
-    if market_returns.empty:
-        raise ValueError("market_returns is required and must align with returns")
-
-    lb = {"beta": 252, "resvol": 252, "mom": 504, "mom_gap": 21, "vol_win": 252}
-    if lookbacks is not None:
-        lb.update({k: int(v) for k, v in lookbacks.items() if k in lb})
-
-    rets = returns.sort_index().copy()
-    caps = mcap.reindex_like(rets)
-    # Ensure mkt index matches returns index and is unique (no duplicate dates)
-    mkt = market_returns.copy()
-    if isinstance(mkt.index, pd.MultiIndex):
-        mkt = mkt.droplevel(-1)
-    mkt = mkt.groupby(level=0).last()
-    mkt = mkt.reindex(rets.index).fillna(0.0)
-
-    size = compute_size(caps.iloc[-1])
-    mom = compute_momentum(rets, mom_win=lb["mom"], gap=lb["mom_gap"])
-    # Dynamic beta/resvol time series; attach last snapshot for exposures
-    beta_ts, resvol_ts = compute_beta_resvol(
-        rets, mkt, beta_win=lb["beta"], resvol_win=lb["resvol"], halflife_beta=63, return_ts=True, method="rolling"
-    )
-    beta = beta_ts.iloc[-1] if isinstance(beta_ts, pd.DataFrame) and not beta_ts.empty else pd.Series(0.0, index=rets.columns)
-    resvol = resvol_ts.iloc[-1] if isinstance(resvol_ts, pd.DataFrame) and not resvol_ts.empty else pd.Series(0.0, index=rets.columns)
-    vol = compute_volatility(rets, mkt, win=lb["vol_win"])
-    liq = compute_liquidity(turnover) if turnover is not None else pd.Series(0.0, index=rets.columns)
-    if eps_trailing is not None and price is not None:
-        eps_tr_last = eps_trailing.iloc[-1].reindex(rets.columns)
-        eps_pred_last = eps_pred.iloc[-1].reindex(rets.columns) if eps_pred is not None else pd.Series(0.0, index=rets.columns)
-        price_last = price.iloc[-1].reindex(rets.columns)
-        ey = compute_earnings_yield(eps_tr_last, eps_pred_last, price_last)
-    else:
-        ey = pd.Series(0.0, index=rets.columns)
-
-    exposures = pd.DataFrame({
-        "SIZE": size, "BETA": beta, "MOM": mom, "RESVOL": resvol,
-        "VOL": vol, "LIQ": liq, "EY": ey,
-    })
-    exposures = exposures.apply(lambda s: (s - s.mean()) / s.std(ddof=0) if s.std(ddof=0) > 0 else s)
-    exposures = exposures.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-    return exposures
-
 
 def compute_cne6_exposures_ts(
     returns: pd.DataFrame,
@@ -998,13 +784,6 @@ def compute_cne6_exposures_ts(
     if not mkt.index.is_unique:
         mkt = mkt.groupby(level=0).mean()
     mkt = mkt.reindex(rets.index).fillna(0.0)
-    # Align market series to returns index with unique dates
-    mkt = market_returns.copy()
-    if isinstance(mkt.index, pd.MultiIndex):
-        mkt = mkt.droplevel(-1)
-    if not mkt.index.is_unique:
-        mkt = mkt.groupby(level=0).mean()
-    mkt = mkt.reindex(rets.index).fillna(0.0)
 
     out: Dict[str, pd.DataFrame] = {}
 
@@ -1018,10 +797,12 @@ def compute_cne6_exposures_ts(
     log1p = np.log1p(rets.fillna(0.0)).to_numpy()
     mom_np = np.full(log1p.shape, np.nan, dtype=np.float32)
     w_flip = weights[::-1].astype(np.float32)
+    n_rows = log1p.shape[0]
     for j in range(log1p.shape[1]):
-        comp = np.convolve(log1p[:, j], w_flip, mode='valid')
-        # place from mom_win-1 onward
-        mom_np[lb["mom"] - 1 :, j] = comp.astype(np.float32)
+        if n_rows >= lb["mom"]:
+            comp = np.convolve(log1p[:, j], w_flip, mode='valid')
+            # place from mom_win-1 onward
+            mom_np[lb["mom"] - 1 :, j] = comp.astype(np.float32)
     mom_df = pd.DataFrame(mom_np, index=rets.index, columns=rets.columns)
     mom_df = mom_df.shift(lb["mom_gap"])  # apply gap
     out["MOM"] = mom_df
@@ -1057,6 +838,7 @@ def compute_cne6_exposures_ts(
             share_turn = (turnover / mcap.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan)
         else:
             share_turn = turnover.copy()
+        # Use full-window semantics so different windows produce distinct signals
         stom = np.log(share_turn.rolling(21).mean() + 1e-6)
         stoq = np.log(share_turn.rolling(63).mean() + 1e-6)
         stoa = np.log(share_turn.rolling(252).mean() + 1e-6)
@@ -1089,6 +871,48 @@ def compute_cne6_exposures_ts(
         ep_pred = eps_pr_ts / price_ts
         ey_ts = 0.5 * ep_trail + 0.5 * ep_pred
         out["EY"] = ey_ts
+
+    # STREV (short-term reversal): EW sum of daily returns over 21d with halflife=5
+    try:
+        win_strev = 21
+        hl_strev = 5
+        w_strev = np.exp(-np.log(2) * np.arange(win_strev) / max(hl_strev, 1))[::-1]
+        w_strev /= w_strev.sum()
+        rets_np = rets.fillna(0.0).to_numpy()
+        strev_np = np.full(rets_np.shape, np.nan, dtype=np.float32)
+        w_flip = w_strev[::-1].astype(np.float32)
+        for j in range(rets_np.shape[1]):
+            comp = np.convolve(rets_np[:, j], w_flip, mode='valid')
+            strev_np[win_strev - 1 :, j] = comp.astype(np.float32)
+        strev_ts = pd.DataFrame(strev_np, index=rets.index, columns=rets.columns)
+        out["STREV"] = strev_ts
+    except Exception as ex:
+        print(f"Failed to compute STREV: {ex}")
+        pass
+
+    # SEASON (seasonality): average of prior 5 years' same-month returns, broadcast to days within the month
+    try:
+        nyears = 5
+        if price is not None and not price.empty:
+            m_last = price.resample("M").last()
+            m_ret = m_last.pct_change()
+        else:
+            m_ret = (1.0 + rets).resample("M").apply(np.prod) - 1.0
+        season_m = None
+        for i in range(1, nyears + 1):
+            shifted = m_ret.shift(12 * i)
+            season_m = shifted if season_m is None else (season_m + shifted)
+        if season_m is None:
+            season_m = m_ret * np.nan
+        season_m = season_m / nyears
+        # Map month-end seasonality to daily dates by reindexing on month_end of daily index
+        month_end_idx = rets.index.to_period("M").to_timestamp("M")
+        season_daily = season_m.reindex(month_end_idx)
+        season_daily.index = rets.index
+        out["SEASON"] = season_daily
+    except Exception as ex:
+        print(f"Failed to compute SEASON: {ex}")
+        pass
 
     # Clean up infinities
     for k, df_ts in list(out.items()):
@@ -1141,26 +965,7 @@ class BarraFactorProcessor(Processor):
     def fit(self, df: pd.DataFrame):
         return self
 
-    def _attach_exposures(self, df: pd.DataFrame, expos: pd.DataFrame) -> pd.DataFrame:
-        if expos is None or expos.empty:
-            return df
-        # Robust instrument level extraction when index names are missing
-        if isinstance(df.index, pd.MultiIndex):
-            idx_names = list(df.index.names)
-            if "instrument" in idx_names:
-                inst_level = idx_names.index("instrument")
-            else:
-                inst_level = df.index.nlevels - 1
-            inst_index = df.index.get_level_values(inst_level)
-        else:
-            inst_index = df.index
-        assign = {}
-        for col in expos.columns:
-            mapping = expos[col]
-            assign[f"B_{col}"] = inst_index.map(mapping).astype(float)
-        if assign:
-            df = df.assign(**assign)
-        return df
+    # (_attach_exposures removed as unused)
 
     def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
         if df is None or df.empty:
