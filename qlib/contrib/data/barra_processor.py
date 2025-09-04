@@ -835,23 +835,26 @@ def compute_beta_resvol(
     resvol_ts = pd.DataFrame(index=rets.index, columns=rets.columns, dtype=float)
 
     if method == "ewm":
-        mkt_var = mkt.ewm(halflife=halflife_beta, min_periods=min_periods, adjust=False).var()
+        local_min = max(1, min(min_periods, len(mkt)))
+        mkt_var = mkt.ewm(halflife=halflife_beta, min_periods=local_min, adjust=False).var()
         mkt_var = mkt_var.replace(0.0, np.nan)
         for col in rets.columns:
-            cov = rets[col].ewm(halflife=halflife_beta, min_periods=min_periods, adjust=False).cov(mkt)
+            cov = rets[col].ewm(halflife=halflife_beta, min_periods=local_min, adjust=False).cov(mkt)
             beta_col = cov / mkt_var
             beta_ts[col] = beta_col
             resid = rets[col] - beta_col * mkt
-            resvol_ts[col] = resid.ewm(halflife=resvol_win // 3 if resvol_win else halflife_beta, min_periods=min_periods, adjust=False).std(bias=False)
+            resvol_ts[col] = resid.ewm(halflife=resvol_win // 3 if resvol_win else halflife_beta, min_periods=local_min, adjust=False).std(bias=False)
     else:
         # simple rolling window
         for col in rets.columns:
-            cov = rets[col].rolling(beta_win, min_periods=min_periods).cov(mkt)
-            var = mkt.rolling(beta_win, min_periods=min_periods).var()
+            local_min_beta = max(1, min(min_periods, beta_win))
+            cov = rets[col].rolling(beta_win, min_periods=local_min_beta).cov(mkt)
+            var = mkt.rolling(beta_win, min_periods=local_min_beta).var()
             beta_col = cov / var.replace(0.0, np.nan)
             beta_ts[col] = beta_col
             resid = rets[col] - beta_col * mkt
-            resvol_ts[col] = resid.rolling(resvol_win, min_periods=min_periods).std()
+            local_min_res = max(1, min(min_periods, resvol_win))
+            resvol_ts[col] = resid.rolling(resvol_win, min_periods=local_min_res).std()
 
     beta_ts = beta_ts.replace([np.inf, -np.inf], np.nan)
     resvol_ts = resvol_ts.replace([np.inf, -np.inf], np.nan)
@@ -923,7 +926,12 @@ def compute_cne6_exposures(
 
     rets = returns.sort_index().copy()
     caps = mcap.reindex_like(rets)
-    mkt = market_returns.reindex(rets.index).fillna(0.0)
+    # Ensure mkt index matches returns index and is unique (no duplicate dates)
+    mkt = market_returns.copy()
+    if isinstance(mkt.index, pd.MultiIndex):
+        mkt = mkt.droplevel(-1)
+    mkt = mkt.groupby(level=0).last()
+    mkt = mkt.reindex(rets.index).fillna(0.0)
 
     size = compute_size(caps.iloc[-1])
     mom = compute_momentum(rets, mom_win=lb["mom"], gap=lb["mom_gap"])
@@ -983,7 +991,20 @@ def compute_cne6_exposures_ts(
 
     rets = returns.sort_index().copy()
     caps = mcap.reindex_like(rets)
-    mkt = market_returns.reindex(rets.index).fillna(0.0)
+    # Align market series to returns index with unique dates
+    mkt = market_returns.copy()
+    if isinstance(mkt.index, pd.MultiIndex):
+        mkt = mkt.droplevel(-1)
+    if not mkt.index.is_unique:
+        mkt = mkt.groupby(level=0).mean()
+    mkt = mkt.reindex(rets.index).fillna(0.0)
+    # Align market series to returns index with unique dates
+    mkt = market_returns.copy()
+    if isinstance(mkt.index, pd.MultiIndex):
+        mkt = mkt.droplevel(-1)
+    if not mkt.index.is_unique:
+        mkt = mkt.groupby(level=0).mean()
+    mkt = mkt.reindex(rets.index).fillna(0.0)
 
     out: Dict[str, pd.DataFrame] = {}
 
@@ -1050,8 +1071,13 @@ def compute_cne6_exposures_ts(
             turnover_rate = share_turn
         atvr = turnover_rate.ewm(halflife=63, min_periods=30, adjust=False).mean() * 252.0
         out["ATVR"] = atvr
-        # Composite LIQ
-        liq_ts = 0.35 * stom + 0.35 * stoq + 0.30 * stoa
+        # Composite LIQ with adaptive weights when some windows are unavailable
+        w_stom = stom.notna().astype(float) * 0.35
+        w_stoq = stoq.notna().astype(float) * 0.35
+        w_stoa = stoa.notna().astype(float) * 0.30
+        w_sum = (w_stom + w_stoq + w_stoa)
+        num = stom.fillna(0.0) * 0.35 + stoq.fillna(0.0) * 0.35 + stoa.fillna(0.0) * 0.30
+        liq_ts = num.div(w_sum.replace(0.0, np.nan))
         out["LIQ"] = liq_ts
 
     # EY time series

@@ -7,6 +7,8 @@ from qlib.contrib.data.barra_processor import (
     BarraFundamentalQualityProcessor,
     BarraCNE6Processor,
     IndustryMomentumProcessor,
+    BarraFactorProcessor,
+    compute_cne6_exposures_ts,
 )
 
 
@@ -103,10 +105,10 @@ def test_fundamental_profile_and_quality(tmp_path):
     val_b = df1.loc[(pd.Timestamp("2024-01-04"), instruments[0]), "F_ROE_RATIO"]
     assert (not pd.isna(val_a)) or (not pd.isna(val_b))
 
-    # F_ME should come from $market_cap when present
-    assert "F_ME" in df1.columns
+    # ME should come from $market_cap when present
+    assert "ME" in df1.columns
     assert np.isclose(
-        float(df1.loc[(dates[5], instruments[1]), "F_ME"]),
+        float(df1.loc[(dates[5], instruments[1]), "ME"]),
         float(df.loc[(dates[5], instruments[1]), "$market_cap"]),
     )
 
@@ -214,7 +216,7 @@ def test_ignore_tickers_not_in_df(tmp_path):
     p = tmp_path / "cn_profile.csv"
     pd.DataFrame(rows).to_csv(p, index=False)
 
-    out = FundamentalProfileProcessor(csv_path=str(p), prefix="F_")(df.copy())
+    out = FundamentalProfileProcessor(csv_path=str(p), prefix="")(df.copy())
     # No values should be assigned since csv ticker not in df instruments
     assert "F_ROE_RATIO" not in out.columns or out["F_ROE_RATIO"].isna().all()
 
@@ -232,9 +234,9 @@ def test_f_me_fallback_to_profile_market_cap(tmp_path):
     p = tmp_path / "cn_profile.csv"
     pd.DataFrame(rows).to_csv(p, index=False)
 
-    out = FundamentalProfileProcessor(csv_path=str(p), prefix="F_")(df.copy())
-    assert "F_ME" in out.columns
-    val_me = out.loc[(dates[-1], instruments[0]), "F_ME"]
+    out = FundamentalProfileProcessor(csv_path=str(p), prefix="")(df.copy())
+    assert "ME" in out.columns
+    val_me = out.loc[(dates[-1], instruments[0]), "ME"]
     assert not pd.isna(val_me) and np.isclose(float(val_me), 1.23e11)
 
 
@@ -252,7 +254,7 @@ def test_quality_nan_preserved(tmp_path):
     p = tmp_path / "cn_profile.csv"
     pd.DataFrame(rows).to_csv(p, index=False)
 
-    df1 = FundamentalProfileProcessor(csv_path=str(p), prefix="F_")(df.copy())
+    df1 = FundamentalProfileProcessor(csv_path=str(p), prefix="")(df.copy())
     df2 = BarraFundamentalQualityProcessor()(df1)
     # Q_DTOA should be NaN when TA is NaN (no zero-fill)
     assert df2["Q_DTOA"].isna().any()
@@ -270,14 +272,14 @@ def test_industry_momentum_basic():
     }
     codes.update({(d, instruments[1]): "BANK" for d in dates})
     codes.update({(d, instruments[2]): "TECH" for d in dates})
-    df["F_INDUSTRY_CODE"] = pd.Series(codes)
+    df["INDUSTRY_CODE"] = pd.Series(codes)
 
     proc = IndustryMomentumProcessor(
         mcap_col="$market_cap", window=3, halflife=2, out_col="B_INDMOM"
     )
     out = proc(df.copy())
     assert "B_INDMOM" in out.columns
-    # On last date, TECH industry has only one stock, so INDMOM ¡Ö 0
+    # On last date, TECH industry has only one stock, so INDMOM ˜ 0
     d_last = dates[-1]
     tech_val = float(out.loc[(d_last, instruments[2]), "B_INDMOM"])
     assert np.isfinite(tech_val) and np.isclose(tech_val, 0.0, atol=1e-10)
@@ -306,7 +308,7 @@ def test_industry_momentum_index_column_name_robustness():
     codes = {(d, instruments[0]): "BANK" for d in dates}
     codes.update({(d, instruments[1]): "BANK" for d in dates})
     codes.update({(d, instruments[2]): "TECH" for d in dates})
-    df["F_INDUSTRY_CODE"] = pd.Series(codes)
+    df["INDUSTRY_CODE"] = pd.Series(codes)
 
     proc = IndustryMomentumProcessor(mcap_col="$market_cap", window=4, halflife=2, out_col="B_INDMOM")
 
@@ -371,7 +373,7 @@ def test_barra_factor_processor_basic(tmp_path):
     assert "F_ROE_RATIO" in out.columns or "F_RETURN_ON_EQUITY" in out.columns
     for col in ["Q_MLEV", "Q_DTOA", "Q_ROA"]:
         assert col in out.columns and out[col].notna().any()
-    assert "F_INDUSTRY_CODE" in out.columns and out["F_INDUSTRY_CODE"].notna().any()
+    assert "INDUSTRY_CODE" in out.columns and out["INDUSTRY_CODE"].notna().any()
 
     # Check CNE6 exposures
     for col in ["B_SIZE", "B_BETA", "B_MOM", "B_RESVOL"]:
@@ -413,3 +415,41 @@ def test_barra_factor_processor_index_column_name_robustness(tmp_path):
     df3 = df3.sort_index()
     out3 = proc(df3)
     assert out3["B_INDMOM"].notna().any()
+
+
+def test_compute_cne6_exposures_ts_basic():
+    # Build small dataset
+    dates = pd.bdate_range("2024-01-01", periods=40)
+    instruments = ["SH600000", "SZ000001", "SZ000002"]
+    df = _make_multiindex_frame(dates, instruments)
+    # Add simple turnover to enable liquidity family
+    df["$turnover"] = 1.0
+
+    # Wide pivots
+    rets = df["$return"].unstack(level="instrument").sort_index()
+    mcap = df["$market_cap"].unstack(level="instrument").sort_index()
+    mkt = df["$market_ret"].droplevel("instrument").sort_index()
+    turn = df["$turnover"].unstack(level="instrument").sort_index()
+
+    expos_ts = compute_cne6_exposures_ts(
+        returns=rets,
+        mcap=mcap,
+        market_returns=mkt,
+        turnover=turn,
+        lookbacks={"beta": 10, "resvol": 10, "mom": 10, "mom_gap": 1, "vol_win": 10},
+        method_beta="rolling",
+        halflife_beta=5,
+    )
+
+    # Expected keys
+    for key in ["SIZE", "MOM", "BETA", "RESVOL", "VOL", "LIQ", "STOM", "STOQ", "STOA", "ATVR"]:
+        assert key in expos_ts
+        assert isinstance(expos_ts[key], pd.DataFrame)
+        assert expos_ts[key].shape == rets.shape
+
+    # Tails should have valid numbers for at least one instrument after warm-up
+    tail_idx = rets.index[-1]
+    for key in ["BETA", "RESVOL", "MOM", "VOL", "SIZE", "LIQ", "ATVR"]:
+        tail_row = expos_ts[key].loc[tail_idx]
+        assert tail_row.notna().any(), f"{key} all NaN at tail"
+    # Windows require full lengths; STOM (21), STOQ (63), STOA (252). On 40 days data, STOQ/STOA may be all NaN at tail.
