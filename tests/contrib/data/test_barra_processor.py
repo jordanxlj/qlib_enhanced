@@ -4,7 +4,7 @@ import numpy as np
 
 from qlib.contrib.data.barra_processor import (
     FundamentalProfileProcessor,
-    IndustryMomentumProcessor,
+    IndustryProcessor,
     BarraFactorProcessor,
     compute_cne6_exposures_ts,
     compute_beta_resvol,
@@ -241,9 +241,7 @@ def test_industry_momentum_basic():
     codes.update({(d, instruments[2]): "TECH" for d in dates})
     df["INDUSTRY_CODE"] = pd.Series(codes)
 
-    proc = IndustryMomentumProcessor(
-        mcap_col="$market_cap", window=3, halflife=2, out_col="B_INDMOM"
-    )
+    proc = IndustryProcessor(csv_path="", compute_momentum=True, window=3, halflife=2)
     out = proc(df.copy())
     assert "B_INDMOM" in out.columns
     # On last date, TECH industry has only one stock, so INDMOM ˜ 0
@@ -277,7 +275,7 @@ def test_industry_momentum_index_column_name_robustness():
     codes.update({(d, instruments[2]): "TECH" for d in dates})
     df["INDUSTRY_CODE"] = pd.Series(codes)
 
-    proc = IndustryMomentumProcessor(mcap_col="$market_cap", window=4, halflife=2, out_col="B_INDMOM")
+    proc = IndustryProcessor(mcap_col="$market_cap", window=4, halflife=2, out_col="B_INDMOM")
 
     # Case 1: names present
     out1 = proc(df.copy())
@@ -620,6 +618,6 @@ def test_industry_momentum_constant_same_industry():
     codes = {(d, instruments[0]): "IND1" for d in dates}
     codes.update({(d, instruments[1]): "IND1" for d in dates})
     df["INDUSTRY_CODE"] = pd.Series(codes)
-    out = IndustryMomentumProcessor(window=126, halflife=21, out_col="B_INDMOM")(df.copy())
+    out = IndustryProcessor(csv_path="", compute_momentum=True, return_col="$return", close_col="$close", mcap_col="$market_cap", industry_col="INDUSTRY_CODE", window=126, halflife=21, out_col="B_INDMOM")(df.copy())
     last = out["B_INDMOM"].groupby(level="instrument").last()
     assert np.allclose(last.values, 0.0, atol=1e-3)

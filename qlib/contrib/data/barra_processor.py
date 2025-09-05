@@ -400,20 +400,31 @@ class FundamentalProfileProcessor(Processor):
 
 
 class IndustryProcessor(Processor):
-    """Attach industry code/name per ticker from a company facts file.
+    """Attach industry code/name per ticker from a company facts file, and optionally compute industry momentum.
 
     - Source: data/others/cn_company_facts.csv (configurable)
     - Required columns: ticker, industry_code, industry
     - Values are static per ticker and will be attached to every date row.
     """
 
-    def __init__(self, csv_path: str = "data/others/cn_company_facts.csv", prefix: str = "", code_col: str = "industry_code", name_col: str = "industry"):
+    def __init__(self, csv_path: str = "data/others/cn_company_facts.csv", prefix: str = "", code_col: str = "industry_code", name_col: str = "industry", *,
+                 compute_momentum: bool = True, return_col: str = "$return", close_col: str = "$close", mcap_col: str = "$market_cap",
+                 industry_col: str = "INDUSTRY_CODE", window: int = 126, halflife: int = 21, out_col: str = "B_INDMOM"):
         super().__init__()
         self.csv_path = csv_path
         self.prefix = prefix
         self.code_col = code_col
         self.name_col = name_col
         self._cache = None  # DataFrame with columns: ticker, code_col, name_col
+        # momentum options
+        self.compute_momentum = compute_momentum
+        self.return_col = return_col
+        self.close_col = close_col
+        self.mcap_col = mcap_col
+        self.industry_col = industry_col
+        self.window = int(window)
+        self.halflife = int(halflife)
+        self.out_col = out_col
 
     def fit(self, df: pd.DataFrame):
         return self
@@ -426,14 +437,11 @@ class IndustryProcessor(Processor):
             try:
                 facts = pd.read_csv(f"{self.csv_path}.csv", low_memory=False)
             except Exception as e2:
-                raise FileNotFoundError(f"Failed to read company facts from {self.csv_path}: {e2}")
+                return pd.DataFrame()
 
         facts.columns = [str(c).strip().lower() for c in facts.columns]
         if "ticker" not in facts.columns:
-            raise ValueError("cn_company_facts must include a 'ticker' column")
-        if self.code_col not in facts.columns and self.name_col not in facts.columns:
-            raise ValueError(f"cn_company_facts must include '{self.code_col}' or '{self.name_col}' column")
-
+            return pd.DataFrame()
         # Normalize tickers to Qlib format, e.g., 300058.SZ -> SZ300058
         facts["ticker"] = facts["ticker"].map(normalize_ticker)
 
@@ -451,91 +459,50 @@ class IndustryProcessor(Processor):
             return df
         assert isinstance(df.index, pd.MultiIndex) and df.index.nlevels == 2, "Input df must be MultiIndex (datetime, instrument)"
 
+        # Attach mapping if file exists
         if self._cache is None:
             self._cache = self._load_mapping()
         facts = self._cache
-        if facts.empty:
-            return df
+        if not facts.empty:
+            # Build mapping dicts
+            code_map = facts.set_index("ticker")[self.code_col].to_dict() if self.code_col in facts.columns else {}
+            name_map = facts.set_index("ticker")[self.name_col].to_dict() if self.name_col in facts.columns else {}
 
-        # Build mapping dicts
-        code_map = facts.set_index("ticker")[self.code_col].to_dict() if self.code_col in facts.columns else {}
-        name_map = facts.set_index("ticker")[self.name_col].to_dict() if self.name_col in facts.columns else {}
-
-        # Robust instrument level extraction when index names are missing
-        if isinstance(df.index, pd.MultiIndex):
-            idx_names = list(df.index.names)
-            if "instrument" in idx_names:
-                inst_level = idx_names.index("instrument")
+            # Robust instrument level extraction when index names are missing
+            if isinstance(df.index, pd.MultiIndex):
+                idx_names = list(df.index.names)
+                if "instrument" in idx_names:
+                    inst_level = idx_names.index("instrument")
+                else:
+                    inst_level = df.index.nlevels - 1
+                inst_index = df.index.get_level_values(inst_level).astype(str)
             else:
-                inst_level = df.index.nlevels - 1
-            inst_index = df.index.get_level_values(inst_level).astype(str)
-        else:
-            inst_index = df.index.astype(str)
-        assign = {}
-        if code_map:
-            assign[f"{self.prefix}INDUSTRY_CODE"] = inst_index.map(code_map)
-        if name_map:
-            assign[f"{self.prefix}INDUSTRY"] = inst_index.map(name_map)
-        if assign:
-            df = df.assign(**assign)
-        return df
+                inst_index = df.index.astype(str)
+            assign = {}
+            if code_map:
+                assign[f"{self.prefix}INDUSTRY_CODE"] = inst_index.map(code_map)
+            if name_map:
+                assign[f"{self.prefix}INDUSTRY"] = inst_index.map(name_map)
+            if assign:
+                df = df.assign(**assign)
 
-
-class IndustryMomentumProcessor(Processor):
-    """Compute Industry Momentum per instrument using vectorized convolution.
-
-    Requirements:
-      - '$return' or '$close' to compute returns
-      - '$market_cap' for weights
-      - 'F_INDUSTRY_CODE' attached by IndustryProcessor
-    Output column: 'B_INDMOM'
-    """
-
-    def __init__(
-        self,
-        *,
-        return_col: str = "$return",
-        close_col: str = "$close",
-        mcap_col: str = "$market_cap",
-        industry_col: str = "INDUSTRY_CODE",
-        window: int = 126,
-        halflife: int = 21,
-        out_col: str = "B_INDMOM",
-        debug: bool = False,
-    ):
-        super().__init__()
-        self.return_col = return_col
-        self.close_col = close_col
-        self.mcap_col = mcap_col
-        self.industry_col = industry_col
-        self.window = int(window)
-        self.halflife = int(halflife)
-        self.out_col = out_col
-        self.debug = debug
-
-    def fit(self, df: pd.DataFrame):
-        return self
-
-    def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty:
+        # Optionally compute industry momentum
+        if not self.compute_momentum:
             return df
-        assert isinstance(df.index, pd.MultiIndex) and df.index.nlevels == 2, "Input df must be MultiIndex (datetime, instrument)"
 
-        def pivot(col: str) -> Optional[pd.DataFrame]:
-            return _pivot_wide(df, col)
-
-        rets = pivot(self.return_col)
+        # Momentum computation requires returns, mcap, and industry column present
+        rets = _pivot_wide(df, self.return_col)
         if rets is None:
-            close = pivot(self.close_col)
+            close = _pivot_wide(df, self.close_col)
             if close is None:
                 return df
             rets = close.pct_change()
-        mcap = pivot(self.mcap_col)
+        mcap = _pivot_wide(df, self.mcap_col)
         if mcap is None:
             return df
-
         if self.industry_col not in df.columns:
             return df
+
         # Determine instrument level robustly
         idx_names_df = list(df.index.names) if isinstance(df.index, pd.MultiIndex) else []
         if "instrument" in idx_names_df:
@@ -949,8 +916,21 @@ class BarraFactorProcessor(Processor):
 
         # 2) Quality factors already computed within FundamentalProfileProcessor
 
-        # 3) Industry mapping
-        df = IndustryProcessor(csv_path=self.facts_csv_path)(df)
+        # 3) Industry mapping + momentum
+        df = IndustryProcessor(
+            csv_path=self.facts_csv_path,
+            prefix="",
+            code_col="industry_code",
+            name_col="industry",
+            compute_momentum=True,
+            return_col="$return",
+            close_col=self.price_col,
+            mcap_col="$market_cap",
+            industry_col="INDUSTRY_CODE",
+            window=self.indmom_window,
+            halflife=self.indmom_halflife,
+            out_col=self.indmom_out,
+        )(df)
 
         # 4) CNE6 exposures (robust pivot)
         returns = _pivot_wide(df, "$return")
@@ -994,17 +974,7 @@ class BarraFactorProcessor(Processor):
                         pass
                 df[f"B_{key}"] = ser.reindex(df.index)
 
-        # 5) Industry momentum (robust write-back & alignment already handled inside)
-        df = IndustryMomentumProcessor(
-            return_col="$return",
-            close_col=self.price_col,
-            mcap_col="$market_cap",
-            industry_col="INDUSTRY_CODE",
-            window=self.indmom_window,
-            halflife=self.indmom_halflife,
-            out_col=self.indmom_out,
-            debug=self.debug,
-        )(df)
+        # Industry momentum already computed above
 
         logger.info("BarraFactorProcessor finished.")
         return df
