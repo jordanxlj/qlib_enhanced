@@ -82,9 +82,12 @@ class FundamentalProfileProcessor(Processor):
         return self
 
     def _load_profile(self) -> pd.DataFrame:
-        if not self.profile_csv_path:
+        if not self.csv_path:
             return pd.DataFrame()
-        prof = pd.read_csv(self.csv_path)
+        try:
+            prof = pd.read_csv(self.csv_path)
+        except (FileNotFoundError, ValueError):
+            return pd.DataFrame()
         # Normalize columns
         prof.columns = [str(c).strip().lower() for c in prof.columns]
         assert "ticker" in prof.columns and self.date_col in prof.columns, "CSV must include ticker and ann_date"
@@ -197,18 +200,12 @@ class FundamentalProfileProcessor(Processor):
         return merged
 
     def _reorder_merged_index(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
-        if merged.empty or not isinstance(merged.index, pd.MultiIndex):
-            return merged
-        # Rename 'trade_date' to 'datetime' if present
-        current_names = list(merged.index.names)
-        if 'trade_date' in current_names:
-            current_names[current_names.index('trade_date')] = 'datetime'
-            merged.index = merged.index.set_names(current_names)
-        # Reorder to match df's index names order
-        target_order = [n for n in df.index.names if n in merged.index.names]
-        if set(merged.index.names) == set(target_order) and list(merged.index.names) != target_order:
-            merged = merged.reorder_levels(target_order)
-        merged = merged.sort_index()
+        # If target df index has unnamed levels, skip reordering by names
+        target_names = list(df.index.names)
+        if any(n is None for n in target_names):
+            return merged.sort_index()
+        if list(merged.index.names) != target_names:
+            merged = merged.reorder_levels(target_names).sort_index()
         return merged
 
     def _assign_factors(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
@@ -312,6 +309,66 @@ class FundamentalProfileProcessor(Processor):
                 df["F_ROE_RATIO"] = df["F_ROE_RATIO"].where(~df["F_ROE_RATIO"].isna(), df["F_RETURN_ON_EQUITY"].astype(float))
         return df
 
+    def _assign_quality_factors(self, df: pd.DataFrame) -> pd.DataFrame:
+        def col(name: str) -> pd.Series:
+            return df.get(name, pd.Series(index=df.index, dtype=float))
+        def safe_div(a: pd.Series, b: pd.Series) -> pd.Series:
+            val = a / b.replace(0, np.nan)
+            return val.replace([np.inf, -np.inf], np.nan)
+        ME = col("ME").astype(float)
+        PE = col("PE").astype(float).fillna(0.0)
+        LD = col("LD").astype(float).fillna(0.0)
+        BE = col("BE").astype(float)
+        TL = col("TL").astype(float)
+        TA = col("TA").astype(float)
+        SALES = col("SALES").astype(float)
+        COGS = col("COGS").astype(float)
+        EARN = col("EARNINGS").astype(float)
+        CASH = col("CASH").astype(float).fillna(0.0)
+        TD = col("TD").astype(float).fillna(0.0)
+        CFO = col("CFO").astype(float).fillna(0.0)
+        CFI = col("CFI").astype(float).fillna(0.0)
+        DA = col("DA").astype(float).fillna(0.0)
+        q_assign: Dict[str, pd.Series] = {}
+        if "F_DTOA_RATIO" in df.columns:
+            q_assign["Q_DTOA"] = df["F_DTOA_RATIO"]
+        if "F_GROSS_MARGIN" in df.columns:
+            q_assign["Q_GPM"] = df["F_GROSS_MARGIN"]
+        if "F_OPERATING_MARGIN" in df.columns:
+            q_assign["Q_OPM"] = df["F_OPERATING_MARGIN"]
+        if "F_NET_MARGIN" in df.columns:
+            q_assign["Q_NPM"] = df["F_NET_MARGIN"]
+        if "F_ROA_RATIO" in df.columns:
+            q_assign["Q_ROA"] = df["F_ROA_RATIO"]
+        if "F_TOTAL_ASSETS_GROWTH" in df.columns and "Q_TAGR" not in q_assign:
+            q_assign["Q_TAGR"] = df["F_TOTAL_ASSETS_GROWTH"]
+        if "Q_MLEV" not in q_assign:
+            q_assign["Q_MLEV"] = safe_div(ME + PE + LD, ME)
+        if "Q_BLEV" not in q_assign:
+            q_assign["Q_BLEV"] = safe_div(BE + PE + LD, ME)
+        if "Q_DTOA" not in q_assign:
+            q_assign["Q_DTOA"] = safe_div(TL, TA)
+        GP = SALES - COGS
+        if "Q_ATO" not in q_assign:
+            q_assign["Q_ATO"] = safe_div(SALES, TA)
+        if "Q_GP" not in q_assign:
+            q_assign["Q_GP"] = safe_div(GP, TA)
+        if "Q_GPM" not in q_assign:
+            q_assign["Q_GPM"] = safe_div(GP, SALES)
+        if "Q_ROA" not in q_assign:
+            q_assign["Q_ROA"] = safe_div(EARN, TA)
+        NOA = (TA - CASH) - (TL - TD)
+        dNOA = NOA.groupby(level=1).diff()
+        ACCR_BS = dNOA - DA
+        if "Q_ABS" not in q_assign:
+            q_assign["Q_ABS"] = -safe_div(ACCR_BS, TA)
+        ACCR_CF = EARN - (CFO + CFI) + DA
+        if "Q_ACF" not in q_assign:
+            q_assign["Q_ACF"] = -safe_div(ACCR_CF, TA)
+        if q_assign:
+            df = df.assign(**q_assign)
+        return df
+
     def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
         if df is None or df.empty:
             return df
@@ -332,107 +389,13 @@ class FundamentalProfileProcessor(Processor):
         df = self._derive_core_fields(merged, df)
         df = self._set_market_equity(merged, df)
         df = self._assign_ratios(merged, df)
+        df = self._assign_quality_factors(df)
         # Attach industry info if available via IndustryProcessor
         try:
             df = IndustryProcessor()(df)
         except Exception:
             # Silently skip if industry mapping not available
             pass
-        return df
-
-
-class BarraFundamentalQualityProcessor(Processor):
-    """Compute Barra CNE6 quality-related factors from fundamental columns.
-
-    This processor expects the DataFrame to already contain fundamental columns from
-    FundamentalProfileProcessor (prefixed by F_), such as:
-      - F_ME, F_PE, F_LD, F_BE, F_TL, F_TA, F_SALES, F_COGS, F_EARNINGS,
-        F_CASH, F_TD, F_CFO, F_CFI, F_DA
-
-    It will compute and attach the following quality factors:
-      - Q_MLEV, Q_BLEV, Q_DTOA, Q_ATO, Q_GP, Q_GPM, Q_ROA, Q_ABS, Q_ACF
-    """
-
-    def fit(self, df: pd.DataFrame):
-        return self
-
-    def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty:
-            return df
-        assert isinstance(df.index, pd.MultiIndex) and df.index.nlevels == 2
-
-        def col(name: str) -> pd.Series:
-            return df.get(name, pd.Series(index=df.index, dtype=float))
-
-        def safe_div(a: pd.Series, b: pd.Series) -> pd.Series:
-            val = a / b.replace(0, np.nan)
-            return val.replace([np.inf, -np.inf], np.nan)
-
-        # Basic components
-        ME = col("ME").astype(float)
-        PE = col("PE").astype(float).fillna(0.0)
-        LD = col("LD").astype(float).fillna(0.0)
-        BE = col("BE").astype(float)
-        TL = col("TL").astype(float)
-        TA = col("TA").astype(float)
-        SALES = col("SALES").astype(float)
-        COGS = col("COGS").astype(float)
-        EARN = col("EARNINGS").astype(float)
-        CASH = col("CASH").astype(float).fillna(0.0)
-        TD = col("TD").astype(float).fillna(0.0)
-        CFO = col("CFO").astype(float).fillna(0.0)
-        CFI = col("CFI").astype(float).fillna(0.0)
-        DA = col("DA").astype(float).fillna(0.0)
-
-        # Prefer ratio columns if available
-        q_assign = {}
-        if "F_DTOA_RATIO" in df.columns:
-            q_assign["Q_DTOA"] = df["F_DTOA_RATIO"]
-        if "F_GROSS_MARGIN" in df.columns:
-            q_assign["Q_GPM"] = df["F_GROSS_MARGIN"]
-        if "F_OPERATING_MARGIN" in df.columns:
-            q_assign["Q_OPM"] = df["F_OPERATING_MARGIN"]
-        if "F_NET_MARGIN" in df.columns:
-            q_assign["Q_NPM"] = df["F_NET_MARGIN"]
-        if "F_ROA_RATIO" in df.columns:
-            q_assign["Q_ROA"] = df["F_ROA_RATIO"]
-        # Attach total assets growth only when present
-        if "Q_TAGR" not in q_assign and "F_TOTAL_ASSETS_GROWTH" in df.columns:
-            q_assign["Q_TAGR"] = df["F_TOTAL_ASSETS_GROWTH"]
-
-        # Leverage (fallback)
-        if "Q_MLEV" not in q_assign:
-            q_assign["Q_MLEV"] = safe_div(ME + PE + LD, ME)
-        if "Q_BLEV" not in q_assign:
-            q_assign["Q_BLEV"] = safe_div(BE + PE + LD, ME)
-        if "Q_DTOA" not in q_assign:
-            q_assign["Q_DTOA"] = safe_div(TL, TA)
-
-        # Profitability & turnover
-        GP = SALES - COGS
-        if "Q_ATO" not in q_assign:
-            q_assign["Q_ATO"] = safe_div(SALES, TA)
-        if "Q_GP" not in q_assign:
-            q_assign["Q_GP"] = safe_div(GP, TA)
-        if "Q_GPM" not in q_assign:
-            q_assign["Q_GPM"] = safe_div(GP, SALES)
-        if "Q_ROA" not in q_assign:
-            q_assign["Q_ROA"] = safe_div(EARN, TA)
-
-        # Accruals
-        NOA = (TA - CASH) - (TL - TD)
-        dNOA = NOA.groupby(level=1).diff()
-        ACCR_BS = dNOA - DA
-        if "Q_ABS" not in q_assign:
-            q_assign["Q_ABS"] = -safe_div(ACCR_BS, TA)
-
-        ACCR_CF = EARN - (CFO + CFI) + DA
-        if "Q_ACF" not in q_assign:
-            q_assign["Q_ACF"] = -safe_div(ACCR_CF, TA)
-
-        if q_assign:
-            df = df.assign(**q_assign)
-
         return df
 
 
@@ -888,11 +851,9 @@ def compute_cne6_exposures_ts(
         rets_np = rets.fillna(0.0).to_numpy()
         strev_np = np.full(rets_np.shape, np.nan, dtype=np.float32)
         w_flip = w_strev[::-1].astype(np.float32)
-        n_rows = rets_np.shape[0]
         for j in range(rets_np.shape[1]):
-            if n_rows >= win_strev:
-                comp = np.convolve(rets_np[:, j], w_flip, mode='valid')
-                strev_np[win_strev - 1 :, j] = comp.astype(np.float32)
+            comp = np.convolve(rets_np[:, j], w_flip, mode='valid')
+            strev_np[win_strev - 1 :, j] = comp.astype(np.float32)
         strev_ts = pd.DataFrame(strev_np, index=rets.index, columns=rets.columns)
         out["STREV"] = strev_ts
     except Exception as ex:
@@ -930,23 +891,6 @@ def compute_cne6_exposures_ts(
         out[k] = df_ts.replace([np.inf, -np.inf], np.nan)
 
     return out
-
-def normalize_ticker(c: str) -> str:
-    c = str(c).upper()
-    if '.' in c:
-        code, exch = c.split('.')
-        return f"{exch}{code}"
-    return c
-
-def parse_ratio(v):
-    if not isinstance(v, str):
-        return float(v) if v is not None else np.nan
-    v = v.strip().replace('%', '').replace(',', '').replace('\u2212', '-').replace('\u2013', '-').replace('\u2014', '-')
-    try:
-        num = float(v)
-        return num / 100 if abs(num) > 1.5 else num
-    except ValueError:
-        return np.nan
 
 class BarraFactorProcessor(Processor):
     """End-to-end processor to attach F_/Q_/Industry/CNE6/B_INDMOM in one pass.
@@ -993,444 +937,20 @@ class BarraFactorProcessor(Processor):
     def fit(self, df: pd.DataFrame):
         return self
 
-    def _load_profile(self) -> pd.DataFrame:
-        if not self.profile_csv_path:
-            return pd.DataFrame()
-        try:
-            prof = pd.read_csv(self.profile_csv_path)
-        except (FileNotFoundError, ValueError):
-            return pd.DataFrame()
-        # Normalize columns
-        prof.columns = [str(c).strip().lower() for c in prof.columns]
-        assert "ticker" in prof.columns and self.date_col in prof.columns, "CSV must include ticker and ann_date"
-
-        # Robust ann_date parsing: accept 'YYYY-MM-DD' or numeric 'YYYYMMDD'
-        raw_ad = prof[self.date_col]
-        # Filter out null ann_date before parsing
-        raw_ad = raw_ad.dropna()
-
-        # Handle possible float by rounding to int and str
-        try:
-            raw_vals = pd.to_numeric(raw_ad, errors='coerce')
-            # Coerce to int, format as 8-digit string
-            raw_ad = raw_vals.round().astype('Int64').apply(lambda x: f"{x:08d}" if pd.notna(x) else "")
-            ad = pd.to_datetime(raw_ad, format='%Y%m%d', errors='coerce')
-        except Exception:
-            raw_ad = raw_ad.astype(str).str.strip()
-            ad = pd.to_datetime(raw_ad, errors='coerce')
-        prof[self.date_col] = ad.dt.normalize()  # Ensure date-only, no time component
-
-        # Normalize ticker to Qlib format, e.g., 300058.SZ -> SZ300058
-        prof["ticker"] = prof["ticker"].map(normalize_ticker)
-
-        # Coerce potential numeric fields to numeric
-        key_cols = {"ticker", self.date_col, "period"}
-        factor_cols_all = [c for c in prof.columns if c not in key_cols]
-        ratio_like = {
-            "gross_margin",
-            "operating_margin",
-            "net_margin",
-            "return_on_equity",
-            "return_on_assets",
-            "debt_to_equity",
-            "debt_to_assets",
-            "return_on_invested_capital",
-            "revenue_growth",
-            "total_assets_growth",
-        }
-        for c in factor_cols_all:
-            series = prof[c]
-            if series.dtype == object:
-                cleaned = (
-                    series.astype(str)
-                    .str.strip()
-                    .str.replace("%", "", regex=False)
-                    .str.replace(",", "", regex=False)
-                    .str.replace(r"[\u2212\u2013\u2014]", "-", regex=True)
-                )
-                col_series = pd.to_numeric(cleaned, errors="coerce")
-            else:
-                col_series = pd.to_numeric(series, errors="coerce")
-            # Scale percentage only for ratio-like columns
-            if c in ratio_like:
-                finite = col_series.replace([np.inf, -np.inf], np.nan).dropna()
-                if not finite.empty and finite.quantile(0.95) > 1.5:
-                    col_series = col_series / 100.0
-
-            # Trim outliers: keep within [0.05, 0.95] quantile range
-            #col_series = trim_outliers(col_series, 0.05, 0.95)
-            prof[c] = col_series
-
-        prof = prof.dropna(subset=[self.date_col])  # Drop invalid ann_date
-        prof.sort_values(["ticker", self.date_col], inplace=True)
-        return prof
-
-    def _extract_index_levels(self, df: pd.DataFrame) -> Tuple[int, int]:
-        idx_names = list(df.index.names)
-        inst_level = idx_names.index("instrument") if "instrument" in idx_names else 1
-        date_level = idx_names.index("datetime") if "datetime" in idx_names else 0
-        return inst_level, date_level
-
-    def _prepare_trade_data(self, df: pd.DataFrame, inst_level: int, date_level: int) -> Tuple[pd.DatetimeIndex, set]:
-        trade_dates = df.index.get_level_values(date_level).unique().sort_values()
-        code_set = set(df.index.get_level_values(inst_level).unique())
-        return trade_dates, code_set
-
-    def _build_merged_fundamentals(self, prof: pd.DataFrame, trade_dates: pd.DatetimeIndex, code_set: set) -> pd.DataFrame:
-        # Filter profile to relevant codes
-        prof = prof[prof["ticker"].isin(code_set)].copy()
-        if prof.empty:
-            return pd.DataFrame()
-        # Expand to daily grid per ticker
-        grid = pd.MultiIndex.from_product([trade_dates, sorted(code_set)], names=["trade_date", "instrument"])
-        daily = pd.DataFrame(index=grid).reset_index()
-        # Merge on ticker=instrument, trade_date >= ann_date
-        merged = pd.merge(daily, prof, left_on="instrument", right_on="ticker", how="left")
-        merged = merged[merged["trade_date"] >= merged[self.date_col]]
-        # For each trade_date/instrument, keep the latest ann_date row
-        merged.sort_values(["instrument", "trade_date", self.date_col], inplace=True)
-        merged = merged.groupby(["instrument", "trade_date"]).last()
-        # Drop unnecessary columns
-        drop_cols = {"ticker", "trade_date", self.date_col, "period"}
-        merged.drop(columns=[c for c in drop_cols if c in merged.columns], inplace=True)
-        return merged
-
-    def _reorder_merged_index(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
-        if merged.empty or not isinstance(merged.index, pd.MultiIndex):
-            return merged
-        # Rename 'trade_date' to 'datetime' if present
-        current_names = list(merged.index.names)
-        if 'trade_date' in current_names:
-            current_names[current_names.index('trade_date')] = 'datetime'
-            merged.index = merged.index.set_names(current_names)
-        # Reorder to match df's index names order
-        target_order = [n for n in df.index.names if n in merged.index.names]
-        if set(merged.index.names) == set(target_order) and list(merged.index.names) != target_order:
-            merged = merged.reorder_levels(target_order)
-        merged = merged.sort_index()
-        return merged
-
-    def _assign_factors(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
-        factor_cols = [c for c in merged.columns if c not in {"instrument", "trade_date"}]
-        for col in factor_cols:
-            ser = merged[col].reindex(df.index).astype(float)
-            df[col.upper()] = ser
-        return df
-
-    def _derive_core_fields(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
-        # Standardize core fields with fallbacks
-        F_ME = merged.get("market_cap", pd.Series(np.nan, index=merged.index))
-        PE = merged.get("preferred_equity", pd.Series(np.nan, index=merged.index)).fillna(0.0)
-        LD = merged.get("long_term_debt", pd.Series(np.nan, index=merged.index)).fillna(0.0)
-        BE = merged.get("shareholders_equity", pd.Series(np.nan, index=merged.index))
-        TL = merged.get("total_liabilities", pd.Series(np.nan, index=merged.index))
-        TA = merged.get("total_assets", pd.Series(np.nan, index=merged.index))
-        SALES = merged.get("revenue", pd.Series(np.nan, index=merged.index))
-        COGS = merged.get("cost_of_goods_sold", pd.Series(np.nan, index=merged.index))
-        EARN = merged.get("net_income", pd.Series(np.nan, index=merged.index))
-        CASH = merged.get("cash", pd.Series(np.nan, index=merged.index)).fillna(0.0)
-        TD = merged.get("total_debt", pd.Series(np.nan, index=merged.index)).fillna(0.0)
-        CFO = merged.get("operating_cash_flow", pd.Series(np.nan, index=merged.index)).fillna(0.0)
-        CFI = merged.get("capital_expenditure", pd.Series(np.nan, index=merged.index)).fillna(0.0)
-        DA = merged.get("depreciation_and_amortization", pd.Series(np.nan, index=merged.index)).fillna(0.0)
-
-        # Assign to df with reindex
-        df = df.assign(
-            F_ME=F_ME.reindex(df.index).astype(float),
-            PE=PE.reindex(df.index).astype(float),
-            LD=LD.reindex(df.index).astype(float),
-            BE=BE.reindex(df.index).astype(float),
-            TL=TL.reindex(df.index).astype(float),
-            TA=TA.reindex(df.index).astype(float),
-            SALES=SALES.reindex(df.index).astype(float),
-            COGS=COGS.reindex(df.index).astype(float),
-            EARNINGS=EARN.reindex(df.index).astype(float),
-            CASH=CASH.reindex(df.index).astype(float),
-            TD=TD.reindex(df.index).astype(float),
-            CFO=CFO.reindex(df.index).astype(float),
-            CFI=CFI.reindex(df.index).astype(float),
-            DA=DA.reindex(df.index).astype(float),
-        )
-        return df
-
-    def _set_market_equity(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
-        if "ME" not in df.columns and "$market_cap" in df.columns:
-            df["ME"] = df["$market_cap"].astype(float)
-        return df
-
-    def _assign_ratios(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
-        def safe_div(a: pd.Series, b: pd.Series) -> pd.Series:
-            return (a / b.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-
-        # ROE: prefer direct field; else compute from EARN / BE
-        if "roe_ratio" in merged.columns:
-            df["F_ROE_RATIO"] = merged["roe_ratio"].reindex(df.index).astype(float)
-        elif "return_on_equity" in merged.columns:
-            df["F_ROE_RATIO"] = merged["return_on_equity"].reindex(df.index).astype(float)
-        elif all(c in df.columns for c in ["EARNINGS", "BE"]):
-            df["F_ROE_RATIO"] = safe_div(df["EARNINGS"], df["BE"])
-
-        if "gross_margin" in merged.columns:
-            df["F_GROSS_MARGIN"] = merged["gross_margin"].reindex(df.index).astype(float)
-        elif all(c in df.columns for c in ["SALES", "COGS"]):
-            df["F_GROSS_MARGIN"] = safe_div(df["SALES"] - df["COGS"], df["SALES"])
-
-        # Backfill F_RETURN_ON_EQUITY from F_ROE_RATIO if missing
-        if "F_RETURN_ON_EQUITY" not in df.columns and "F_ROE_RATIO" in df.columns:
-            df["F_RETURN_ON_EQUITY"] = df["F_ROE_RATIO"]
-        elif "F_RETURN_ON_EQUITY" in df.columns and "F_ROE_RATIO" in df.columns:
-            df["F_RETURN_ON_EQUITY"] = np.where(
-                (~df["F_ROE_RATIO"].isna()), df["F_RETURN_ON_EQUITY"].astype(float), df["F_ROE_RATIO"]
-            )
-        return df
-
-    def _attach_industry(self, df: pd.DataFrame) -> pd.DataFrame:
-        if not self.facts_csv_path:
-            return df
-        try:
-            facts = pd.read_csv(self.facts_csv_path, low_memory=False)
-        except Exception:
-            try:
-                facts = pd.read_csv(f"{self.facts_csv_path}.csv", low_memory=False)
-            except Exception:
-                return df
-        facts.columns = [str(c).strip().lower() for c in facts.columns]
-        if "ticker" not in facts.columns:
-            return df
-        facts["ticker"] = facts["ticker"].map(normalize_ticker)
-        code_col = "industry_code"
-        name_col = "industry"
-        keep_cols = ["ticker"] + [c for c in [code_col, name_col] if c in facts.columns]
-        facts = facts[keep_cols].copy()
-        facts.sort_values(["ticker"], inplace=True)
-        facts = facts.drop_duplicates(subset=["ticker"], keep="last")
-        code_map = facts.set_index("ticker")[code_col].to_dict() if code_col in facts.columns else {}
-        name_map = facts.set_index("ticker")[name_col].to_dict() if name_col in facts.columns else {}
-        if isinstance(df.index, pd.MultiIndex):
-            idx_names = list(df.index.names)
-            if "instrument" in idx_names:
-                inst_level = idx_names.index("instrument")
-            else:
-                inst_level = df.index.nlevels - 1
-            inst_index = df.index.get_level_values(inst_level).astype(str)
-        else:
-            inst_index = df.index.astype(str)
-        assign = {}
-        if code_map:
-            assign["INDUSTRY_CODE"] = inst_index.map(code_map)
-        if name_map:
-            assign["INDUSTRY"] = inst_index.map(name_map)
-        if assign:
-            df = df.assign(**assign)
-        return df
-
-    def _compute_industry_momentum(self, df: pd.DataFrame) -> pd.DataFrame:
-        def pivot(col: str) -> Optional[pd.DataFrame]:
-            return _pivot_wide(df, col)
-        rets = pivot("$return")
-        if rets is None:
-            close = pivot(self.price_col)
-            if close is None:
-                return df
-            rets = close.pct_change()
-        mcap = pivot("$market_cap")
-        if mcap is None:
-            return df
-        if "INDUSTRY_CODE" not in df.columns:
-            return df
-        idx_names_df = list(df.index.names) if isinstance(df.index, pd.MultiIndex) else []
-        if "instrument" in idx_names_df:
-            inst_level_df = idx_names_df.index("instrument")
-        else:
-            inst_level_df = (df.index.nlevels - 1) if isinstance(df.index, pd.MultiIndex) else 0
-        ind_map = df["INDUSTRY_CODE"].groupby(level=inst_level_df).last().dropna().astype(str)
-        if ind_map.empty:
-            return df
-        common_cols = ind_map.index.intersection(rets.columns)
-        if len(common_cols) == 0:
-            return df
-        rets = rets[common_cols]
-        mcap = mcap.reindex(columns=common_cols)
-        # RS via weighted rolling of log(1+r)
-        window = int(self.indmom_window)
-        halflife = int(self.indmom_halflife)
-        if rets.shape[0] < window:
-            df[self.indmom_out] = 0.0
-            return df
-        weights = np.exp(-np.log(2) * np.arange(window) / max(halflife, 1))[::-1]
-        weights /= weights.sum()
-        log1p = np.log1p(rets.fillna(0.0)).to_numpy()
-        rs_np = np.full(log1p.shape, np.nan, dtype=np.float32)
-        w_flip = weights[::-1].astype(np.float32)
-        n_rows = log1p.shape[0]
-        for j in range(log1p.shape[1]):
-            if n_rows >= window:
-                rs_col = np.convolve(log1p[:, j], w_flip, mode='valid')
-                rs_np[window - 1 :, j] = rs_col.astype(np.float32)
-        rs_df = pd.DataFrame(rs_np, index=rets.index, columns=rets.columns)
-        # weights sqrt(mcap)
-        mcap = mcap.replace([np.inf, -np.inf], np.nan).ffill()
-        w_raw = np.sqrt(mcap.clip(lower=0)).replace([np.inf, -np.inf], np.nan)
-        w_sum = w_raw.sum(axis=1).replace(0, np.nan)
-        w_norm = w_raw.div(w_sum, axis=0)
-        # group by industry
-        ind_to_cols = {ind: list(g.index) for ind, g in ind_map.groupby(ind_map)}
-        industry_rs_df = pd.DataFrame(index=rs_df.index, columns=ind_to_cols.keys())
-        for ind, cols in ind_to_cols.items():
-            if not cols:
-                continue
-            w_ind = w_norm[cols]
-            den = w_ind.sum(axis=1)
-            w_ind = w_ind.div(den.replace(0, np.nan), axis=0)
-            if len(cols) > 0:
-                w_ind = w_ind.fillna(1.0 / float(len(cols)))
-            industry_rs_df[ind] = (rs_df[cols] * w_ind).sum(axis=1)
-        ind_map_aligned = ind_map.reindex(common_cols)
-        rs_ind_for_inst = industry_rs_df[ind_map_aligned.values].set_axis(common_cols, axis=1)
-        # normalize weights within industry daily
-        c_norm = pd.DataFrame(index=rs_df.index, columns=common_cols, dtype=float)
-        for ind, cols in ind_to_cols.items():
-            w_ind = w_raw[cols]
-            den = w_ind.sum(axis=1)
-            w_ind = w_ind.div(den.replace(0, np.nan), axis=0)
-            if len(cols) > 0:
-                w_ind = w_ind.fillna(1.0 / float(len(cols)))
-            c_norm[cols] = w_ind
-        indmom = rs_ind_for_inst - c_norm * rs_df
-        indmom.columns.name = "instrument"
-        indmom.index.name = "datetime"
-        ser = indmom.stack().rename(self.indmom_out)
-        if any(n is None for n in df.index.names) or list(ser.index.names) != list(df.index.names):
-            try:
-                ser = ser.reorder_levels(df.index.names).sort_index()
-            except Exception:
-                pass
-        df[self.indmom_out] = ser.reindex(df.index)
-        return df
+    # (_attach_exposures removed as unused)
 
     def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
         if df is None or df.empty:
             return df
         assert isinstance(df.index, pd.MultiIndex) and df.index.nlevels == 2, "Input df must be MultiIndex (datetime, instrument)"
 
-        # Load profile once
-        prof = self._load_profile()
+        # 1) Fundamentals
+        df = FundamentalProfileProcessor(csv_path=self.profile_csv_path, prefix="")(df)
 
-        # 1) Fundamentals attach with fallback
-        inst_level, date_level = self._extract_index_levels(df)
-        trade_dates, code_set = self._prepare_trade_data(df, inst_level, date_level)
+        # 2) Quality factors already computed within FundamentalProfileProcessor
 
-        # Extract inst_index for fallback
-        if isinstance(df.index, pd.MultiIndex):
-            idx_names = list(df.index.names)
-            if "instrument" in idx_names:
-                inst_level = idx_names.index("instrument")
-            else:
-                inst_level = df.index.nlevels - 1
-            inst_index = df.index.get_level_values(inst_level).astype(str)
-        else:
-            inst_index = df.index.astype(str)
-
-        try:
-            merged = self._build_merged_fundamentals(prof, trade_dates, code_set)
-            if not merged.empty:
-                merged = self._reorder_merged_index(merged, df)
-                df = self._assign_factors(merged, df)
-                df = self._derive_core_fields(merged, df)
-                df = self._set_market_equity(merged, df)
-                df = self._assign_ratios(merged, df)
-            else:
-                raise ValueError("Merged fundamentals empty, fallback to simple last values")
-        except Exception as ex:
-            # Fallback to simple last values per instrument
-            # F_ROE
-            roe_series = pd.Series(index=df.index, dtype=float)
-            if not prof.empty and ("return_on_equity" in prof.columns):
-                last_roe = prof.sort_values(["ticker", "ann_date"]).groupby("ticker")["return_on_equity"].last()
-                last_roe = last_roe.apply(parse_ratio)
-                last_roe_dict = {normalize_ticker(t): v for t, v in last_roe.to_dict().items()}
-                roe_series = pd.Series(inst_index.map(last_roe_dict), index=df.index).fillna(np.nan)
-            df = df.assign(F_RETURN_ON_EQUITY=roe_series, F_ROE_RATIO=roe_series)
-
-            if "$market_cap" in df.columns:
-                df["ME"] = df["$market_cap"].astype(float)
-
-            # Q_DTOA
-            q_series = pd.Series(index=df.index, dtype=float)
-            if not prof.empty and {"total_liabilities", "total_assets"}.issubset(set(prof.columns)):
-                last_tl = prof.sort_values(["ticker", "ann_date"]).groupby("ticker")["total_liabilities"].last()
-                last_tl = last_tl.apply(parse_ratio)
-                last_tl_dict = {normalize_ticker(t): v for t, v in last_tl.to_dict().items()}
-                tl_m = pd.Series(inst_index.map(last_tl_dict), index=df.index).astype(float)
-                last_ta = prof.sort_values(["ticker", "ann_date"]).groupby("ticker")["total_assets"].last()
-                last_ta = last_ta.apply(parse_ratio)
-                last_ta_dict = {normalize_ticker(t): v for t, v in last_ta.to_dict().items()}
-                ta_m = pd.Series(inst_index.map(last_ta_dict), index=df.index).astype(float)
-                q_series = (tl_m / ta_m.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-            df = df.assign(Q_DTOA=q_series)
-
-        # 1.5) Quality factors (inline)
-        try:
-            def col(name: str) -> pd.Series:
-                prefixed = self.profile_prefix + name
-                return df.get(prefixed, df.get(name, pd.Series(index=df.index, dtype=float)))
-
-            def safe_div(a: pd.Series, b: pd.Series) -> pd.Series:
-                val = a / b.replace(0, np.nan)
-                return val.replace([np.inf, -np.inf], np.nan)
-
-            # Basic components
-            ME = col("ME").astype(float)
-            PE = col("PE").astype(float).fillna(0.0)
-            LD = col("LD").astype(float).fillna(0.0)
-            BE = col("BE").astype(float)
-            TL = col("TL").astype(float)
-            TA = col("TA").astype(float)
-            SALES = col("SALES").astype(float)
-            COGS = col("COGS").astype(float)
-            EARN = col("EARNINGS").astype(float)
-            CASH = col("CASH").astype(float).fillna(0.0)
-            TD = col("TD").astype(float).fillna(0.0)
-            CFO = col("CFO").astype(float).fillna(0.0)
-            CFI = col("CFI").astype(float).fillna(0.0)
-            DA = col("DA").astype(float).fillna(0.0)
-
-            q_assign = {}
-            # Prefer pre-computed ratios if available
-            if "F_DTOA_RATIO" in df.columns:
-                q_assign["Q_DTOA"] = df["F_DTOA_RATIO"]
-            if "F_GROSS_MARGIN" in df.columns:
-                q_assign["Q_GPM"] = df["F_GROSS_MARGIN"]
-            if "F_ROA_RATIO" in df.columns:
-                q_assign["Q_ROA"] = df["F_ROA_RATIO"]
-            # Add similar checks for other ratios as needed
-
-            # Compute any missing quality factors
-            if "Q_MLEV" not in q_assign:
-                q_assign["Q_MLEV"] = safe_div(ME + PE + LD, BE)
-            if "Q_BLEV" not in q_assign:
-                q_assign["Q_BLEV"] = safe_div(BE + PE + LD, BE)
-            if "Q_DTOA" not in q_assign:
-                q_assign["Q_DTOA"] = safe_div(TL, TA)
-            if "Q_ATO" not in q_assign:
-                q_assign["Q_ATO"] = safe_div(SALES, TA)
-            if "Q_GP" not in q_assign:
-                q_assign["Q_GP"] = safe_div(SALES - COGS, TA)
-            if "Q_GPM" not in q_assign:
-                q_assign["Q_GPM"] = safe_div(SALES - COGS, SALES)
-            if "Q_ROA" not in q_assign:
-                q_assign["Q_ROA"] = safe_div(EARN, TA)
-            if "Q_ABS" not in q_assign:
-                q_assign["Q_ABS"] = safe_div(CFO + CFI, CASH + TD)
-            if "Q_ACF" not in q_assign:
-                q_assign["Q_ACF"] = safe_div(EARN - CFO + DA, TA)
-
-            df = df.assign(**q_assign)
-        except Exception:
-            pass
-
-        # 2) Industry mapping (inline)
-        df = self._attach_industry(df)
+        # 3) Industry mapping
+        df = IndustryProcessor(csv_path=self.facts_csv_path)(df)
 
         # 4) CNE6 exposures (robust pivot)
         returns = _pivot_wide(df, "$return")
@@ -1474,8 +994,17 @@ class BarraFactorProcessor(Processor):
                         pass
                 df[f"B_{key}"] = ser.reindex(df.index)
 
-        # 6) Industry momentum (inline)
-        df = self._compute_industry_momentum(df)
+        # 5) Industry momentum (robust write-back & alignment already handled inside)
+        df = IndustryMomentumProcessor(
+            return_col="$return",
+            close_col=self.price_col,
+            mcap_col="$market_cap",
+            industry_col="INDUSTRY_CODE",
+            window=self.indmom_window,
+            halflife=self.indmom_halflife,
+            out_col=self.indmom_out,
+            debug=self.debug,
+        )(df)
 
         logger.info("BarraFactorProcessor finished.")
         return df
