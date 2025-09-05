@@ -561,7 +561,7 @@ def test_momentum_constant_returns_long_window():
         returns=rets,
         mcap=mcap,
         market_returns=mkt,
-        lookbacks={"mom": 504, "mom_gap": 21, "halflife_mom": 126},
+        lookbacks={"mom": 252, "mom_gap": 21, "halflife_mom": 126},
     )
     mom_tail = float(expos_ts["MOM"][instruments[0]].iloc[-1])
     assert abs(mom_tail - np.log1p(r)) < 1e-9
