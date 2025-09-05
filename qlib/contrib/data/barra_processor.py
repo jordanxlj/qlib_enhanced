@@ -771,7 +771,7 @@ def compute_cne6_exposures_ts(
     if market_returns.empty:
         raise ValueError("market_returns is required and must align with returns")
 
-    lb = {"beta": 252, "resvol": 252, "mom": 504, "mom_gap": 21, "vol_win": 252}
+    lb = {"beta": 252, "resvol": 252, "mom": 252, "mom_gap": 21, "vol_win": 252}
     if lookbacks is not None:
         lb.update({k: int(v) for k, v in lookbacks.items() if k in lb})
 
@@ -833,26 +833,25 @@ def compute_cne6_exposures_ts(
 
     # LIQ family time series: STOM/STOQ/STOA/ATVR, normalized by market cap when available
     if turnover is not None and not turnover.empty:
-        # Normalize turnover by market cap when provided
-        if mcap is not None and not mcap.empty:
-            share_turn = (turnover / mcap.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan)
-        else:
-            share_turn = turnover.copy()
+        # Input is turnover rate already; use directly
+        rate_df = turnover.astype(float)
+
         # Use full-window semantics so different windows produce distinct signals
-        stom = np.log(share_turn.rolling(21).mean() + 1e-6)
-        stoq = np.log(share_turn.rolling(63).mean() + 1e-6)
-        stoa = np.log(share_turn.rolling(252).mean() + 1e-6)
+        # Use log1p so zero rates map to 0 (not a large negative constant)
+        mean_21 = rate_df.clip(lower=0).rolling(21).mean()
+        mean_63 = rate_df.clip(lower=0).rolling(63).mean()
+        mean_252 = rate_df.clip(lower=0).rolling(252).mean()
+        stom = np.log1p(mean_21)
+        stoq = np.log1p(mean_63)
+        stoa = np.log1p(mean_252)
         out["STOM"] = stom
         out["STOQ"] = stoq
         out["STOA"] = stoa
-        # ATVR: prefer turnover rate if likely in [0,1], else fall back to share_turn
-        med = float(np.nanmedian(turnover.to_numpy())) if turnover.size else np.nan
-        if not np.isnan(med) and med <= 1.0:
-            turnover_rate = turnover
-        else:
-            turnover_rate = share_turn
-        atvr = turnover_rate.ewm(halflife=63, min_periods=30, adjust=False).mean() * 252.0
+
+        # ATVR from the same base rate
+        atvr = rate_df.ewm(halflife=63, min_periods=30, adjust=False).mean() * 252.0
         out["ATVR"] = atvr
+
         # Composite LIQ with adaptive weights when some windows are unavailable
         w_stom = stom.notna().astype(float) * 0.35
         w_stoq = stoq.notna().astype(float) * 0.35

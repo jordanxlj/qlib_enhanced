@@ -5,10 +5,10 @@ import numpy as np
 from qlib.contrib.data.barra_processor import (
     FundamentalProfileProcessor,
     BarraFundamentalQualityProcessor,
-    BarraCNE6Processor,
     IndustryMomentumProcessor,
     BarraFactorProcessor,
     compute_cne6_exposures_ts,
+    compute_beta_resvol,
 )
 
 
@@ -535,3 +535,98 @@ def test_beta_resvol_identity_market():
     resvol_tail = expos_ts["RESVOL"].iloc[-1]
     assert np.allclose(beta_tail.values, 1.0, atol=1e-6, rtol=0)
     assert np.allclose(resvol_tail.values, 0.0, atol=1e-10, rtol=0)
+
+
+def test_size_from_ts_snapshot():
+    # SIZE equals -log(ME) snapshot on tail
+    dates = pd.bdate_range("2024-01-01", periods=10)
+    instruments = ["SH600000", "SZ000001"]
+    rets = pd.DataFrame(0.0, index=dates, columns=instruments)
+    mcap = pd.DataFrame([[1e10, 1e12]] * len(dates), index=dates, columns=instruments)
+    mkt = pd.Series(0.0, index=dates)
+    expos_ts = compute_cne6_exposures_ts(rets, mcap, mkt)
+    size_tail = expos_ts["SIZE"].iloc[-1]
+    expected = -np.log(mcap.iloc[-1])
+    assert np.allclose(size_tail.values, expected.values)
+
+
+def test_momentum_constant_returns_long_window():
+    dates = pd.bdate_range("2024-01-01", periods=600)
+    instruments = ["SH600000"]
+    r = 0.005
+    rets = pd.DataFrame(r, index=dates, columns=instruments)
+    mcap = pd.DataFrame(1e9, index=dates, columns=instruments)
+    mkt = pd.Series(0.0, index=dates)
+    expos_ts = compute_cne6_exposures_ts(
+        returns=rets,
+        mcap=mcap,
+        market_returns=mkt,
+        lookbacks={"mom": 504, "mom_gap": 21, "halflife_mom": 126},
+    )
+    mom_tail = float(expos_ts["MOM"][instruments[0]].iloc[-1])
+    assert abs(mom_tail - np.log1p(r)) < 1e-9
+
+
+def test_beta_resvol_slope_approx():
+    # Stock ~ 1.5 * market + noise -> beta ~ 1.5
+    rng = np.random.RandomState(0)
+    dates = pd.bdate_range("2024-01-01", periods=300)
+    mkt = pd.Series(rng.normal(0.0, 0.02, len(dates)), index=dates)
+    rets = pd.DataFrame(1.5 * mkt.values + rng.normal(0.0, 0.01, len(dates)), index=dates, columns=["SH600000"])
+    beta, resvol = compute_beta_resvol(rets, mkt, beta_win=252, resvol_win=252, halflife_beta=63)
+    assert np.isclose(float(beta.iloc[0]), 1.5, atol=0.1)
+    assert 0.0 < float(resvol.iloc[0]) < 0.05
+
+
+def test_volatility_monotonicity():
+    # Higher variance returns should produce higher VOL tail (all else equal)
+    dates = pd.bdate_range("2024-01-01", periods=300)
+    rng = np.random.RandomState(42)
+    mkt = pd.Series(rng.normal(0.0, 0.01, len(dates)), index=dates)
+    low = pd.DataFrame(np.random.normal(0.0, 0.01, len(dates)), index=dates, columns=["SH600000"])
+    high = pd.DataFrame(np.random.normal(0.0, 0.03, len(dates)), index=dates, columns=["SH600000"])
+    mcap = pd.DataFrame(1e9, index=dates, columns=["SH600000"])
+    vol_low = compute_cne6_exposures_ts(low, mcap, mkt, lookbacks={"vol_win": 252})["VOL"].iloc[-1, 0]
+    vol_high = compute_cne6_exposures_ts(high, mcap, mkt, lookbacks={"vol_win": 252})["VOL"].iloc[-1, 0]
+    assert vol_high > vol_low
+
+
+def test_liquidity_constant_rate_ts():
+    dates = pd.bdate_range("2024-01-01", periods=300)
+    instruments = ["SH600000"]
+    rets = pd.DataFrame(0.0, index=dates, columns=instruments)
+    mcap = pd.DataFrame(1e9, index=dates, columns=instruments)
+    mkt = pd.Series(0.0, index=dates)
+    turn = pd.DataFrame(0.02, index=dates, columns=instruments)
+    expos_ts = compute_cne6_exposures_ts(rets, mcap, mkt, turnover=turn)
+    liq_tail = float(expos_ts["LIQ"].iloc[-1, 0])
+    expected = np.log1p(0.02)
+    assert abs(liq_tail - expected) < 1e-9
+
+
+def test_earnings_yield_ts():
+    dates = pd.bdate_range("2024-01-01", periods=10)
+    instruments = ["SH600000"]
+    price = pd.DataFrame(20.0, index=dates, columns=instruments)
+    eps_tr = pd.DataFrame(2.0, index=dates, columns=instruments)
+    eps_pred = pd.DataFrame(2.5, index=dates, columns=instruments)
+    rets = pd.DataFrame(0.0, index=dates, columns=instruments)
+    mcap = pd.DataFrame(1e9, index=dates, columns=instruments)
+    mkt = pd.Series(0.0, index=dates)
+    out = compute_cne6_exposures_ts(rets, mcap, mkt, price=price, eps_trailing=eps_tr, eps_pred=eps_pred)
+    ey_tail = float(out["EY"].iloc[-1, 0])
+    expected = 0.5 * (2.0 / 20.0) + 0.5 * (2.5 / 20.0)
+    assert abs(ey_tail - expected) < 1e-12
+
+
+def test_industry_momentum_constant_same_industry():
+    dates = pd.bdate_range("2024-01-01", periods=200)
+    instruments = ["SH600000", "SZ000001"]
+    df = _make_multiindex_frame(dates, instruments)
+    df["$market_cap"] = 1.0e8
+    codes = {(d, instruments[0]): "IND1" for d in dates}
+    codes.update({(d, instruments[1]): "IND1" for d in dates})
+    df["INDUSTRY_CODE"] = pd.Series(codes)
+    out = IndustryMomentumProcessor(window=126, halflife=21, out_col="B_INDMOM")(df.copy())
+    last = out["B_INDMOM"].groupby(level="instrument").last()
+    assert np.allclose(last.values, 0.0, atol=1e-3)
