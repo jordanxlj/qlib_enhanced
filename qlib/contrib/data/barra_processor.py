@@ -63,7 +63,268 @@ def _pivot_wide(df: pd.DataFrame, col: str) -> Optional[pd.DataFrame]:
     return wide
 
 
-class FundamentalProfileProcessor(Processor):
+def _safe_log(series: pd.Series, eps: float = 1e-12) -> pd.Series:
+    return np.log(series.clip(lower=eps))
+
+
+def compute_beta_resvol(
+        returns: pd.DataFrame,
+        market_returns: pd.Series,
+        beta_win: int = 252,
+        resvol_win: int = 252,
+        halflife_beta: int = 63,
+        *,
+        return_ts: bool = False,
+        method: str = "ewm",
+        min_periods: int = 30,
+) -> Tuple[pd.Series, pd.Series]:
+    """Compute CAPM beta and residual volatility.
+
+    When return_ts is False (default), returns cross-sectional snapshot Series (index: instruments).
+    When return_ts is True, returns time series DataFrames (index: datetime, columns: instruments).
+
+    method: 'ewm' (exponentially weighted with halflife) or 'rolling' (simple rolling window).
+    """
+    if returns.empty or market_returns.empty:
+        if return_ts:
+            return pd.DataFrame(), pd.DataFrame()
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+
+    rets = returns.sort_index().astype(float)
+    mkt = market_returns.sort_index().astype(float)
+    rets = rets.reindex(index=mkt.index).fillna(0.0)
+    mkt = mkt.fillna(0.0)
+
+    if not return_ts:
+        win = max(beta_win, resvol_win)
+        rets_win = rets.iloc[-win:]
+        mkt_win = mkt.iloc[-win:]
+        weights = np.exp(-np.log(2) * np.arange(win) / max(halflife_beta, 1))[::-1]
+        weights /= weights.sum()
+        rets_mean_w = rets_win.T.dot(weights)
+        rets_center = rets_win - rets_mean_w
+        mkt_mean_w = mkt_win.dot(weights)
+        mkt_center = mkt_win - mkt_mean_w
+        var_m = mkt_center.dot(weights * mkt_center)
+        if var_m <= 0:
+            zero = pd.Series(0.0, index=rets.columns)
+            return zero, zero
+        cov = rets_center.multiply(weights * mkt_center, axis=0).sum(axis=0)
+        beta = cov / var_m
+        fitted = pd.DataFrame(np.outer(mkt_win, beta), index=rets_win.index, columns=rets_win.columns)
+        resid = rets_win - fitted
+        resvol = resid.std()
+        return beta, resvol
+
+    # Time series mode
+    beta_ts = pd.DataFrame(index=rets.index, columns=rets.columns, dtype=float)
+    resvol_ts = pd.DataFrame(index=rets.index, columns=rets.columns, dtype=float)
+
+    if method == "ewm":
+        local_min = max(1, min(min_periods, len(mkt)))
+        mkt_var = mkt.ewm(halflife=halflife_beta, min_periods=local_min, adjust=False).var()
+        mkt_var = mkt_var.replace(0.0, np.nan)
+        for col in rets.columns:
+            cov = rets[col].ewm(halflife=halflife_beta, min_periods=local_min, adjust=False).cov(mkt)
+            beta_col = cov / mkt_var
+            beta_ts[col] = beta_col
+            resid = rets[col] - beta_col * mkt
+            resvol_ts[col] = resid.ewm(halflife=resvol_win // 3 if resvol_win else halflife_beta, min_periods=local_min, adjust=False).std(bias=False)
+    else:
+        # simple rolling window
+        for col in rets.columns:
+            local_min_beta = max(1, min(min_periods, beta_win))
+            cov = rets[col].rolling(beta_win, min_periods=local_min_beta).cov(mkt)
+            var = mkt.rolling(beta_win, min_periods=local_min_beta).var()
+            beta_col = cov / var.replace(0.0, np.nan)
+            beta_ts[col] = beta_col
+            resid = rets[col] - beta_col * mkt
+            local_min_res = max(1, min(min_periods, resvol_win))
+            resvol_ts[col] = resid.rolling(resvol_win, min_periods=local_min_res).std()
+
+    beta_ts = beta_ts.replace([np.inf, -np.inf], np.nan)
+    resvol_ts = resvol_ts.replace([np.inf, -np.inf], np.nan)
+    return beta_ts, resvol_ts
+
+
+
+def compute_cne6_exposures_ts(
+        returns: pd.DataFrame,
+        mcap: pd.DataFrame,
+        market_returns: pd.Series,
+        turnover: Optional[pd.DataFrame] = None,
+        eps_trailing: Optional[pd.DataFrame] = None,
+        eps_pred: Optional[pd.DataFrame] = None,
+        price: Optional[pd.DataFrame] = None,
+        *,
+        lookbacks: Optional[Dict[str, int]] = None,
+        method_beta: str = "rolling",
+        halflife_beta: int = 63,
+) -> Dict[str, pd.DataFrame]:
+    """Compute daily time series exposures for CNE6 factors.
+
+    Returns a dict of DataFrames keyed by factor name (e.g., 'SIZE','BETA','MOM','RESVOL','VOL','LIQ','EY').
+    Each DataFrame is indexed by datetime and has instruments as columns.
+    """
+    if returns.empty:
+        return {}
+    if mcap.empty:
+        raise ValueError("mcap is required and must align with returns")
+    if market_returns.empty:
+        raise ValueError("market_returns is required and must align with returns")
+
+    lb = {"beta": 252, "resvol": 252, "mom": 252, "mom_gap": 21, "vol_win": 252}
+    if lookbacks is not None:
+        lb.update({k: int(v) for k, v in lookbacks.items() if k in lb})
+
+    rets = returns.sort_index().copy()
+    caps = mcap.reindex_like(rets)
+    # Align market series to returns index with unique dates
+    mkt = market_returns.copy()
+    if isinstance(mkt.index, pd.MultiIndex):
+        mkt = mkt.droplevel(-1)
+    if not mkt.index.is_unique:
+        mkt = mkt.groupby(level=0).mean()
+    mkt = mkt.reindex(rets.index).fillna(0.0)
+
+    out: Dict[str, pd.DataFrame] = {}
+
+    # SIZE: -log(ME) daily
+    size_ts = -_safe_log(caps)
+    out["SIZE"] = size_ts
+
+    # MOM: weighted rolling of log(1+r), then shift by gap
+    weights = np.exp(-np.log(2) * np.arange(lb["mom"]) / max(lb.get("halflife_mom", lb["mom"] // 4), 1))[::-1]
+    weights /= weights.sum()
+    log1p = np.log1p(rets.fillna(0.0)).to_numpy()
+    mom_np = np.full(log1p.shape, np.nan, dtype=np.float32)
+    w_flip = weights[::-1].astype(np.float32)
+    n_rows = log1p.shape[0]
+    for j in range(log1p.shape[1]):
+        if n_rows >= lb["mom"]:
+            comp = np.convolve(log1p[:, j], w_flip, mode='valid')
+            # place from mom_win-1 onward
+            mom_np[lb["mom"] - 1 :, j] = comp.astype(np.float32)
+    mom_df = pd.DataFrame(mom_np, index=rets.index, columns=rets.columns)
+    mom_df = mom_df.shift(lb["mom_gap"])  # apply gap
+    out["MOM"] = mom_df
+
+    # Beta & ResVol time series
+    beta_ts, resvol_ts = compute_beta_resvol(
+        rets, mkt, beta_win=lb["beta"], resvol_win=lb["resvol"], halflife_beta=halflife_beta, return_ts=True, method=method_beta
+    )
+    out["BETA"] = beta_ts
+    out["RESVOL"] = resvol_ts
+
+    # VOL time series
+    # DASTD
+    win = lb["vol_win"]
+    w_vol = np.exp(-np.log(2) * np.arange(win) / max(int(win // 6) or 1, 1))[::-1]
+    w_vol /= w_vol.sum()
+    def _dastd_col(x: np.ndarray) -> float:
+        return float(np.sqrt(np.nansum(w_vol * np.square(np.nan_to_num(x)))))
+    dastd_ts = rets.rolling(win).apply(_dastd_col, raw=True)
+    # CMRA approximated as rolling range of cumulative log returns
+    cmra_window = min(win, 252)
+    cum_log_ret = np.log1p(rets).cumsum()
+    cmra_ts = cum_log_ret.rolling(cmra_window).apply(lambda a: float(np.nanmax(a) - np.nanmin(a)), raw=True)
+    # Use ResVol as HSIGMA component
+    hsigma_ts = resvol_ts.reindex_like(rets)
+    vol_ts = 0.74 * dastd_ts + 0.16 * cmra_ts + 0.10 * hsigma_ts
+    out["VOL"] = vol_ts
+
+    # LIQ family time series: STOM/STOQ/STOA/ATVR, normalized by market cap when available
+    if turnover is not None and not turnover.empty:
+        # Input is turnover rate already; use directly
+        rate_df = turnover.astype(float)
+
+        # Use full-window semantics so different windows produce distinct signals
+        # Use log1p so zero rates map to 0 (not a large negative constant)
+        mean_21 = rate_df.clip(lower=0).rolling(21).mean()
+        mean_63 = rate_df.clip(lower=0).rolling(63).mean()
+        mean_252 = rate_df.clip(lower=0).rolling(252).mean()
+        stom = np.log1p(mean_21)
+        stoq = np.log1p(mean_63)
+        stoa = np.log1p(mean_252)
+        out["STOM"] = stom
+        out["STOQ"] = stoq
+        out["STOA"] = stoa
+
+        # ATVR from the same base rate
+        atvr = rate_df.ewm(halflife=63, min_periods=30, adjust=False).mean() * 252.0
+        out["ATVR"] = atvr
+
+        # Composite LIQ with adaptive weights when some windows are unavailable
+        w_stom = stom.notna().astype(float) * 0.35
+        w_stoq = stoq.notna().astype(float) * 0.35
+        w_stoa = stoa.notna().astype(float) * 0.30
+        w_sum = (w_stom + w_stoq + w_stoa)
+        num = stom.fillna(0.0) * 0.35 + stoq.fillna(0.0) * 0.35 + stoa.fillna(0.0) * 0.30
+        liq_ts = num.div(w_sum.replace(0.0, np.nan))
+        out["LIQ"] = liq_ts
+
+    # EY time series
+    if eps_trailing is not None and price is not None:
+        eps_tr_ts = eps_trailing.reindex_like(price).astype(float)
+        eps_pr_ts = eps_pred.reindex_like(price).astype(float) if eps_pred is not None else pd.DataFrame(0.0, index=price.index, columns=price.columns)
+        price_ts = price.astype(float).replace(0.0, np.nan)
+        ep_trail = eps_tr_ts / price_ts
+        ep_pred = eps_pr_ts / price_ts
+        ey_ts = 0.5 * ep_trail + 0.5 * ep_pred
+        out["EY"] = ey_ts
+
+    # STREV (short-term reversal): EW sum of daily returns over 21d with halflife=5
+    try:
+        win_strev = 21
+        hl_strev = 5
+        w_strev = np.exp(-np.log(2) * np.arange(win_strev) / max(hl_strev, 1))[::-1]
+        w_strev /= w_strev.sum()
+        rets_np = rets.fillna(0.0).to_numpy()
+        strev_np = np.full(rets_np.shape, np.nan, dtype=np.float32)
+        w_flip = w_strev[::-1].astype(np.float32)
+        for j in range(rets_np.shape[1]):
+            comp = np.convolve(rets_np[:, j], w_flip, mode='valid')
+            strev_np[win_strev - 1 :, j] = comp.astype(np.float32)
+        strev_ts = pd.DataFrame(strev_np, index=rets.index, columns=rets.columns)
+        out["STREV"] = strev_ts
+    except Exception as ex:
+        print(f"Failed to compute STREV: {ex}")
+        pass
+
+    # SEASON (seasonality): average of prior 5 years' same-month returns, broadcast to days within the month
+    try:
+        nyears = 5
+        if price is not None and not price.empty:
+            m_last = price.resample("M").last()
+            m_ret = m_last.pct_change()
+        else:
+            m_ret = (1.0 + rets).resample("M").apply(np.prod) - 1.0
+        season_m = None
+        for i in range(1, nyears + 1):
+            shifted = m_ret.shift(12 * i)
+            season_m = shifted if season_m is None else (season_m + shifted)
+        if season_m is None:
+            season_m = m_ret * np.nan
+        season_m = season_m / nyears
+        # Map month-end seasonality to daily dates by reindexing on month_end of daily index
+        month_end_idx = rets.index.to_period("M").to_timestamp("M")
+        season_daily = season_m.reindex(month_end_idx)
+        season_daily.index = rets.index
+        out["SEASON"] = season_daily
+    except Exception as ex:
+        print(f"Failed to compute SEASON: {ex}")
+        pass
+
+    # Clean up infinities
+    for k, df_ts in list(out.items()):
+        if df_ts is None or df_ts.empty:
+            continue
+        out[k] = df_ts.replace([np.inf, -np.inf], np.nan)
+
+    return out
+
+
+class FundamentalFactorProcessor(Processor):
     """Load cn_profile fundamentals and align by announcement windows.
 
     - Source: data/others/cn_profile.csv
@@ -399,7 +660,7 @@ class FundamentalProfileProcessor(Processor):
         return df
 
 
-class IndustryProcessor(Processor):
+class IndustryFactorProcessor(Processor):
     """Attach industry code/name per ticker from a company facts file, and optionally compute industry momentum.
 
     - Source: data/others/cn_company_facts.csv (configurable)
@@ -599,266 +860,6 @@ class IndustryProcessor(Processor):
         return df
 
 
-def _safe_log(series: pd.Series, eps: float = 1e-12) -> pd.Series:
-    return np.log(series.clip(lower=eps))
-
-
-def compute_beta_resvol(
-    returns: pd.DataFrame,
-    market_returns: pd.Series,
-    beta_win: int = 252,
-    resvol_win: int = 252,
-    halflife_beta: int = 63,
-    *,
-    return_ts: bool = False,
-    method: str = "ewm",
-    min_periods: int = 30,
-) -> Tuple[pd.Series, pd.Series]:
-    """Compute CAPM beta and residual volatility.
-
-    When return_ts is False (default), returns cross-sectional snapshot Series (index: instruments).
-    When return_ts is True, returns time series DataFrames (index: datetime, columns: instruments).
-
-    method: 'ewm' (exponentially weighted with halflife) or 'rolling' (simple rolling window).
-    """
-    if returns.empty or market_returns.empty:
-        if return_ts:
-            return pd.DataFrame(), pd.DataFrame()
-        return pd.Series(dtype=float), pd.Series(dtype=float)
-
-    rets = returns.sort_index().astype(float)
-    mkt = market_returns.sort_index().astype(float)
-    rets = rets.reindex(index=mkt.index).fillna(0.0)
-    mkt = mkt.fillna(0.0)
-
-    if not return_ts:
-        win = max(beta_win, resvol_win)
-        rets_win = rets.iloc[-win:]
-        mkt_win = mkt.iloc[-win:]
-        weights = np.exp(-np.log(2) * np.arange(win) / max(halflife_beta, 1))[::-1]
-        weights /= weights.sum()
-        rets_mean_w = rets_win.T.dot(weights)
-        rets_center = rets_win - rets_mean_w
-        mkt_mean_w = mkt_win.dot(weights)
-        mkt_center = mkt_win - mkt_mean_w
-        var_m = mkt_center.dot(weights * mkt_center)
-        if var_m <= 0:
-            zero = pd.Series(0.0, index=rets.columns)
-            return zero, zero
-        cov = rets_center.multiply(weights * mkt_center, axis=0).sum(axis=0)
-        beta = cov / var_m
-        fitted = pd.DataFrame(np.outer(mkt_win, beta), index=rets_win.index, columns=rets_win.columns)
-        resid = rets_win - fitted
-        resvol = resid.std()
-        return beta, resvol
-
-    # Time series mode
-    beta_ts = pd.DataFrame(index=rets.index, columns=rets.columns, dtype=float)
-    resvol_ts = pd.DataFrame(index=rets.index, columns=rets.columns, dtype=float)
-
-    if method == "ewm":
-        local_min = max(1, min(min_periods, len(mkt)))
-        mkt_var = mkt.ewm(halflife=halflife_beta, min_periods=local_min, adjust=False).var()
-        mkt_var = mkt_var.replace(0.0, np.nan)
-        for col in rets.columns:
-            cov = rets[col].ewm(halflife=halflife_beta, min_periods=local_min, adjust=False).cov(mkt)
-            beta_col = cov / mkt_var
-            beta_ts[col] = beta_col
-            resid = rets[col] - beta_col * mkt
-            resvol_ts[col] = resid.ewm(halflife=resvol_win // 3 if resvol_win else halflife_beta, min_periods=local_min, adjust=False).std(bias=False)
-    else:
-        # simple rolling window
-        for col in rets.columns:
-            local_min_beta = max(1, min(min_periods, beta_win))
-            cov = rets[col].rolling(beta_win, min_periods=local_min_beta).cov(mkt)
-            var = mkt.rolling(beta_win, min_periods=local_min_beta).var()
-            beta_col = cov / var.replace(0.0, np.nan)
-            beta_ts[col] = beta_col
-            resid = rets[col] - beta_col * mkt
-            local_min_res = max(1, min(min_periods, resvol_win))
-            resvol_ts[col] = resid.rolling(resvol_win, min_periods=local_min_res).std()
-
-    beta_ts = beta_ts.replace([np.inf, -np.inf], np.nan)
-    resvol_ts = resvol_ts.replace([np.inf, -np.inf], np.nan)
-    return beta_ts, resvol_ts
-
-
-
-def compute_cne6_exposures_ts(
-    returns: pd.DataFrame,
-    mcap: pd.DataFrame,
-    market_returns: pd.Series,
-    turnover: Optional[pd.DataFrame] = None,
-    eps_trailing: Optional[pd.DataFrame] = None,
-    eps_pred: Optional[pd.DataFrame] = None,
-    price: Optional[pd.DataFrame] = None,
-    *,
-    lookbacks: Optional[Dict[str, int]] = None,
-    method_beta: str = "rolling",
-    halflife_beta: int = 63,
-) -> Dict[str, pd.DataFrame]:
-    """Compute daily time series exposures for CNE6 factors.
-
-    Returns a dict of DataFrames keyed by factor name (e.g., 'SIZE','BETA','MOM','RESVOL','VOL','LIQ','EY').
-    Each DataFrame is indexed by datetime and has instruments as columns.
-    """
-    if returns.empty:
-        return {}
-    if mcap.empty:
-        raise ValueError("mcap is required and must align with returns")
-    if market_returns.empty:
-        raise ValueError("market_returns is required and must align with returns")
-
-    lb = {"beta": 252, "resvol": 252, "mom": 252, "mom_gap": 21, "vol_win": 252}
-    if lookbacks is not None:
-        lb.update({k: int(v) for k, v in lookbacks.items() if k in lb})
-
-    rets = returns.sort_index().copy()
-    caps = mcap.reindex_like(rets)
-    # Align market series to returns index with unique dates
-    mkt = market_returns.copy()
-    if isinstance(mkt.index, pd.MultiIndex):
-        mkt = mkt.droplevel(-1)
-    if not mkt.index.is_unique:
-        mkt = mkt.groupby(level=0).mean()
-    mkt = mkt.reindex(rets.index).fillna(0.0)
-
-    out: Dict[str, pd.DataFrame] = {}
-
-    # SIZE: -log(ME) daily
-    size_ts = -_safe_log(caps)
-    out["SIZE"] = size_ts
-
-    # MOM: weighted rolling of log(1+r), then shift by gap
-    weights = np.exp(-np.log(2) * np.arange(lb["mom"]) / max(lb.get("halflife_mom", lb["mom"] // 4), 1))[::-1]
-    weights /= weights.sum()
-    log1p = np.log1p(rets.fillna(0.0)).to_numpy()
-    mom_np = np.full(log1p.shape, np.nan, dtype=np.float32)
-    w_flip = weights[::-1].astype(np.float32)
-    n_rows = log1p.shape[0]
-    for j in range(log1p.shape[1]):
-        if n_rows >= lb["mom"]:
-            comp = np.convolve(log1p[:, j], w_flip, mode='valid')
-            # place from mom_win-1 onward
-            mom_np[lb["mom"] - 1 :, j] = comp.astype(np.float32)
-    mom_df = pd.DataFrame(mom_np, index=rets.index, columns=rets.columns)
-    mom_df = mom_df.shift(lb["mom_gap"])  # apply gap
-    out["MOM"] = mom_df
-
-    # Beta & ResVol time series
-    beta_ts, resvol_ts = compute_beta_resvol(
-        rets, mkt, beta_win=lb["beta"], resvol_win=lb["resvol"], halflife_beta=halflife_beta, return_ts=True, method=method_beta
-    )
-    out["BETA"] = beta_ts
-    out["RESVOL"] = resvol_ts
-
-    # VOL time series
-    # DASTD
-    win = lb["vol_win"]
-    w_vol = np.exp(-np.log(2) * np.arange(win) / max(int(win // 6) or 1, 1))[::-1]
-    w_vol /= w_vol.sum()
-    def _dastd_col(x: np.ndarray) -> float:
-        return float(np.sqrt(np.nansum(w_vol * np.square(np.nan_to_num(x)))))
-    dastd_ts = rets.rolling(win).apply(_dastd_col, raw=True)
-    # CMRA approximated as rolling range of cumulative log returns
-    cmra_window = min(win, 252)
-    cum_log_ret = np.log1p(rets).cumsum()
-    cmra_ts = cum_log_ret.rolling(cmra_window).apply(lambda a: float(np.nanmax(a) - np.nanmin(a)), raw=True)
-    # Use ResVol as HSIGMA component
-    hsigma_ts = resvol_ts.reindex_like(rets)
-    vol_ts = 0.74 * dastd_ts + 0.16 * cmra_ts + 0.10 * hsigma_ts
-    out["VOL"] = vol_ts
-
-    # LIQ family time series: STOM/STOQ/STOA/ATVR, normalized by market cap when available
-    if turnover is not None and not turnover.empty:
-        # Input is turnover rate already; use directly
-        rate_df = turnover.astype(float)
-
-        # Use full-window semantics so different windows produce distinct signals
-        # Use log1p so zero rates map to 0 (not a large negative constant)
-        mean_21 = rate_df.clip(lower=0).rolling(21).mean()
-        mean_63 = rate_df.clip(lower=0).rolling(63).mean()
-        mean_252 = rate_df.clip(lower=0).rolling(252).mean()
-        stom = np.log1p(mean_21)
-        stoq = np.log1p(mean_63)
-        stoa = np.log1p(mean_252)
-        out["STOM"] = stom
-        out["STOQ"] = stoq
-        out["STOA"] = stoa
-
-        # ATVR from the same base rate
-        atvr = rate_df.ewm(halflife=63, min_periods=30, adjust=False).mean() * 252.0
-        out["ATVR"] = atvr
-
-        # Composite LIQ with adaptive weights when some windows are unavailable
-        w_stom = stom.notna().astype(float) * 0.35
-        w_stoq = stoq.notna().astype(float) * 0.35
-        w_stoa = stoa.notna().astype(float) * 0.30
-        w_sum = (w_stom + w_stoq + w_stoa)
-        num = stom.fillna(0.0) * 0.35 + stoq.fillna(0.0) * 0.35 + stoa.fillna(0.0) * 0.30
-        liq_ts = num.div(w_sum.replace(0.0, np.nan))
-        out["LIQ"] = liq_ts
-
-    # EY time series
-    if eps_trailing is not None and price is not None:
-        eps_tr_ts = eps_trailing.reindex_like(price).astype(float)
-        eps_pr_ts = eps_pred.reindex_like(price).astype(float) if eps_pred is not None else pd.DataFrame(0.0, index=price.index, columns=price.columns)
-        price_ts = price.astype(float).replace(0.0, np.nan)
-        ep_trail = eps_tr_ts / price_ts
-        ep_pred = eps_pr_ts / price_ts
-        ey_ts = 0.5 * ep_trail + 0.5 * ep_pred
-        out["EY"] = ey_ts
-
-    # STREV (short-term reversal): EW sum of daily returns over 21d with halflife=5
-    try:
-        win_strev = 21
-        hl_strev = 5
-        w_strev = np.exp(-np.log(2) * np.arange(win_strev) / max(hl_strev, 1))[::-1]
-        w_strev /= w_strev.sum()
-        rets_np = rets.fillna(0.0).to_numpy()
-        strev_np = np.full(rets_np.shape, np.nan, dtype=np.float32)
-        w_flip = w_strev[::-1].astype(np.float32)
-        for j in range(rets_np.shape[1]):
-            comp = np.convolve(rets_np[:, j], w_flip, mode='valid')
-            strev_np[win_strev - 1 :, j] = comp.astype(np.float32)
-        strev_ts = pd.DataFrame(strev_np, index=rets.index, columns=rets.columns)
-        out["STREV"] = strev_ts
-    except Exception as ex:
-        print(f"Failed to compute STREV: {ex}")
-        pass
-
-    # SEASON (seasonality): average of prior 5 years' same-month returns, broadcast to days within the month
-    try:
-        nyears = 5
-        if price is not None and not price.empty:
-            m_last = price.resample("M").last()
-            m_ret = m_last.pct_change()
-        else:
-            m_ret = (1.0 + rets).resample("M").apply(np.prod) - 1.0
-        season_m = None
-        for i in range(1, nyears + 1):
-            shifted = m_ret.shift(12 * i)
-            season_m = shifted if season_m is None else (season_m + shifted)
-        if season_m is None:
-            season_m = m_ret * np.nan
-        season_m = season_m / nyears
-        # Map month-end seasonality to daily dates by reindexing on month_end of daily index
-        month_end_idx = rets.index.to_period("M").to_timestamp("M")
-        season_daily = season_m.reindex(month_end_idx)
-        season_daily.index = rets.index
-        out["SEASON"] = season_daily
-    except Exception as ex:
-        print(f"Failed to compute SEASON: {ex}")
-        pass
-
-    # Clean up infinities
-    for k, df_ts in list(out.items()):
-        if df_ts is None or df_ts.empty:
-            continue
-        out[k] = df_ts.replace([np.inf, -np.inf], np.nan)
-
-    return out
-
 class BarraFactorProcessor(Processor):
     """End-to-end processor to attach F_/Q_/Industry/CNE6/B_INDMOM in one pass.
 
@@ -911,13 +912,8 @@ class BarraFactorProcessor(Processor):
             return df
         assert isinstance(df.index, pd.MultiIndex) and df.index.nlevels == 2, "Input df must be MultiIndex (datetime, instrument)"
 
-        # 1) Fundamentals
-        df = FundamentalProfileProcessor(csv_path=self.profile_csv_path, prefix="")(df)
-
-        # 2) Quality factors already computed within FundamentalProfileProcessor
-
-        # 3) Industry mapping + momentum
-        df = IndustryProcessor(
+        df = FundamentalFactorProcessor(csv_path=self.profile_csv_path, prefix="")(df)
+        df = IndustryFactorProcessor(
             csv_path=self.facts_csv_path,
             prefix="",
             code_col="industry_code",
