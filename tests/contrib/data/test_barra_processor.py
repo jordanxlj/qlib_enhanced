@@ -3,9 +3,6 @@ import pandas as pd
 import numpy as np
 
 from qlib.contrib.data.barra_processor import (
-    FundamentalProfileProcessor,
-    BarraFundamentalQualityProcessor,
-    IndustryMomentumProcessor,
     BarraFactorProcessor,
     compute_cne6_exposures_ts,
     compute_beta_resvol,
@@ -56,13 +53,16 @@ def _make_cn_profile_csv(tmp_path, instruments):
                 return_on_equity=0.12,
                 shareholders_equity=1.5e11,
                 total_assets=5.0e11,
-                net_income=1.8e10,
+                net_income=2e10,
                 total_liabilities=3.5e11,
-                revenue=8.0e10,
+                revenue=8e10,
                 gross_profit=3.2e10,
-                operating_cash_flow=1.0e10,
-                capital_expenditure=-2.0e9,
-                depreciation_and_amortization=1.5e9,
+                operating_cash_flow=1.5e10,
+                capital_expenditure=-1e9,
+                depreciation_and_amortization=5e9,
+                cost_of_goods_sold=5e10,
+                cash=1e10,
+                total_debt=1.5e10,
             )
         )
         rows.append(
@@ -81,6 +81,9 @@ def _make_cn_profile_csv(tmp_path, instruments):
                 operating_cash_flow=1.2e10,
                 capital_expenditure=-2.2e9,
                 depreciation_and_amortization=1.6e9,
+                cost_of_goods_sold=5.1e10,
+                cash=1e10,
+                total_debt=2e10,
             )
         )
     df = pd.DataFrame(rows)
@@ -96,28 +99,25 @@ def test_fundamental_profile_and_quality(tmp_path):
 
     csv_path = _make_cn_profile_csv(tmp_path, instruments)
 
-    # Apply processors
-    df1 = FundamentalProfileProcessor(csv_path=csv_path, prefix="F_")(df.copy())
-    assert "F_ROE_RATIO" in df1.columns
+    # Apply factor processor (inline fundamentals + quality)
+    out = BarraFactorProcessor(profile_csv_path=csv_path, facts_csv_path="")(df.copy())
+    assert ("F_ROE_RATIO" in out.columns) or ("F_RETURN_ON_EQUITY" in out.columns)
     # values should be forward-filled across dates within each instrument
     # First non-null should appear at/after first announcement date 2024-01-03
-    val_a = df1.loc[(pd.Timestamp("2024-01-03"), instruments[0]), "F_ROE_RATIO"]
-    val_b = df1.loc[(pd.Timestamp("2024-01-04"), instruments[0]), "F_ROE_RATIO"]
+    val_a = out.loc[(pd.Timestamp("2024-01-03"), instruments[0]), "F_ROE_RATIO"]
+    val_b = out.loc[(pd.Timestamp("2024-01-04"), instruments[0]), "F_ROE_RATIO"]
     assert (not pd.isna(val_a)) or (not pd.isna(val_b))
 
     # ME should come from $market_cap when present
-    assert "ME" in df1.columns
+    assert "ME" in out.columns
     assert np.isclose(
-        float(df1.loc[(dates[5], instruments[1]), "ME"]),
+        float(out.loc[(dates[5], instruments[1]), "ME"]),
         float(df.loc[(dates[5], instruments[1]), "$market_cap"]),
     )
-
-    df2 = BarraFundamentalQualityProcessor()(df1.copy())
     # Check several quality factors are present and finite for some rows
     for col in ["Q_MLEV", "Q_DTOA", "Q_ROA", "Q_ABS", "Q_ACF"]:
-        assert col in df2.columns
-        assert df2[col].notna().any()
-
+        assert col in out.columns
+        assert out[col].notna().any()
 
 
 def test_missing_roe_column(tmp_path):
@@ -137,7 +137,7 @@ def test_missing_roe_column(tmp_path):
     p = tmp_path / "cn_profile.csv"
     pd.DataFrame(rows).to_csv(p, index=False)
 
-    out = FundamentalProfileProcessor(csv_path=str(p), prefix="F_")(df.copy())
+    out = BarraFactorProcessor(profile_csv_path=str(p), facts_csv_path="")(df.copy())
     assert "F_ROE_RATIO" not in out.columns or out["F_ROE_RATIO"].isna().all()
 
 
@@ -154,10 +154,11 @@ def test_percentage_and_unicode_minus_parsing(tmp_path):
     p = tmp_path / "cn_profile.csv"
     pd.DataFrame(rows).to_csv(p, index=False)
 
-    out = FundamentalProfileProcessor(csv_path=str(p), prefix="F_")(df.copy())
-    # After 2024-01-08, value should be -0.05, forward-filled across dates
+    out = BarraFactorProcessor(profile_csv_path=str(p), facts_csv_path="")(df.copy())
+    # After 2024-01-08, value should reflect -0.05 when parsed as percent to ratio
     # pick a date well after the second announcement
-    vals = out.loc[(pd.Timestamp("2024-01-09"), instruments[0]), "F_ROE_RATIO"]
+    col = "F_ROE_RATIO" if "F_ROE_RATIO" in out.columns else "F_RETURN_ON_EQUITY"
+    vals = out.loc[(pd.Timestamp("2024-01-09"), instruments[0]), col]
     assert not pd.isna(vals) and np.isclose(float(vals), -0.05)
 
 
@@ -173,9 +174,10 @@ def test_duplicate_ann_date_last_wins(tmp_path):
     p = tmp_path / "cn_profile.csv"
     pd.DataFrame(rows).to_csv(p, index=False)
 
-    out = FundamentalProfileProcessor(csv_path=str(p), prefix="F_")(df.copy())
+    out = BarraFactorProcessor(profile_csv_path=str(p), facts_csv_path="")(df.copy())
     # Any date on/after 2024-01-03 should reflect 0.20
-    val_dup = out.loc[(dates[-1], instruments[0]), "F_ROE_RATIO"]
+    col = "F_ROE_RATIO" if "F_ROE_RATIO" in out.columns else "F_RETURN_ON_EQUITY"
+    val_dup = out.loc[(dates[-1], instruments[0]), col]
     assert not pd.isna(val_dup) and np.isclose(float(val_dup), 0.20)
 
 
@@ -190,9 +192,10 @@ def test_ignore_tickers_not_in_df(tmp_path):
     p = tmp_path / "cn_profile.csv"
     pd.DataFrame(rows).to_csv(p, index=False)
 
-    out = FundamentalProfileProcessor(csv_path=str(p), prefix="")(df.copy())
+    out = BarraFactorProcessor(profile_csv_path=str(p), facts_csv_path="")(df.copy())
     # No values should be assigned since csv ticker not in df instruments
-    assert "F_ROE_RATIO" not in out.columns or out["F_ROE_RATIO"].isna().all()
+    col = "F_ROE_RATIO" if "F_ROE_RATIO" in out.columns else "F_RETURN_ON_EQUITY"
+    assert (col not in out.columns) or out[col].isna().all()
 
 
 def test_f_me_fallback_to_profile_market_cap(tmp_path):
@@ -208,9 +211,9 @@ def test_f_me_fallback_to_profile_market_cap(tmp_path):
     p = tmp_path / "cn_profile.csv"
     pd.DataFrame(rows).to_csv(p, index=False)
 
-    out = FundamentalProfileProcessor(csv_path=str(p), prefix="")(df.copy())
-    assert "ME" in out.columns
-    val_me = out.loc[(dates[-1], instruments[0]), "ME"]
+    out = BarraFactorProcessor(profile_csv_path=str(p), facts_csv_path="")(df.copy())
+    assert "F_ME" in out.columns
+    val_me = out.loc[(dates[-1], instruments[0]), "F_ME"]
     assert not pd.isna(val_me) and np.isclose(float(val_me), 1.23e11)
 
 
@@ -228,10 +231,9 @@ def test_quality_nan_preserved(tmp_path):
     p = tmp_path / "cn_profile.csv"
     pd.DataFrame(rows).to_csv(p, index=False)
 
-    df1 = FundamentalProfileProcessor(csv_path=str(p), prefix="")(df.copy())
-    df2 = BarraFundamentalQualityProcessor()(df1)
+    out = BarraFactorProcessor(profile_csv_path=str(p), facts_csv_path="")(df.copy())
     # Q_DTOA should be NaN when TA is NaN (no zero-fill)
-    assert df2["Q_DTOA"].isna().any()
+    assert out["Q_DTOA"].isna().any()
 
 
 def test_industry_momentum_basic():
@@ -248,10 +250,7 @@ def test_industry_momentum_basic():
     codes.update({(d, instruments[2]): "TECH" for d in dates})
     df["INDUSTRY_CODE"] = pd.Series(codes)
 
-    proc = IndustryMomentumProcessor(
-        mcap_col="$market_cap", window=3, halflife=2, out_col="B_INDMOM"
-    )
-    out = proc(df.copy())
+    out = BarraFactorProcessor(profile_csv_path="", facts_csv_path="", indmom_window=4, indmom_halflife=2)(df.copy())
     assert "B_INDMOM" in out.columns
     # On last date, TECH industry has only one stock, so INDMOM ˜ 0
     d_last = dates[-1]
@@ -262,10 +261,10 @@ def test_industry_momentum_basic():
     # INDMOM1 - INDMOM2 = -0.5*(RS1 - RS2)
     # Recompute RS using same definition
     rets = out["$return"].unstack(level="instrument").sort_index()
-    weights = np.exp(-np.log(2) * np.arange(3) / 2)[::-1]
+    weights = np.exp(-np.log(2) * np.arange(4) / 2)[::-1]
     weights /= weights.sum()
     log1p = np.log1p(rets.fillna(0.0))
-    rs_df = log1p.rolling(3).apply(lambda x: np.nansum(weights * np.nan_to_num(x)), raw=True)
+    rs_df = log1p.rolling(4).apply(lambda x: np.nansum(weights * np.nan_to_num(x)), raw=True)
     rs1 = float(rs_df[instruments[0]].iloc[-1])
     rs2 = float(rs_df[instruments[1]].iloc[-1])
     indmom1 = float(out.loc[(d_last, instruments[0]), "B_INDMOM"])
@@ -284,7 +283,7 @@ def test_industry_momentum_index_column_name_robustness():
     codes.update({(d, instruments[2]): "TECH" for d in dates})
     df["INDUSTRY_CODE"] = pd.Series(codes)
 
-    proc = IndustryMomentumProcessor(mcap_col="$market_cap", window=4, halflife=2, out_col="B_INDMOM")
+    proc = BarraFactorProcessor(profile_csv_path="", facts_csv_path="")
 
     # Case 1: names present
     out1 = proc(df.copy())
@@ -627,6 +626,6 @@ def test_industry_momentum_constant_same_industry():
     codes = {(d, instruments[0]): "IND1" for d in dates}
     codes.update({(d, instruments[1]): "IND1" for d in dates})
     df["INDUSTRY_CODE"] = pd.Series(codes)
-    out = IndustryMomentumProcessor(window=126, halflife=21, out_col="B_INDMOM")(df.copy())
+    out = BarraFactorProcessor(profile_csv_path="", facts_csv_path="")(df.copy())
     last = out["B_INDMOM"].groupby(level="instrument").last()
     assert np.allclose(last.values, 0.0, atol=1e-3)

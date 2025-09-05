@@ -199,12 +199,16 @@ class FundamentalProfileProcessor(Processor):
     def _reorder_merged_index(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
         if merged.empty or not isinstance(merged.index, pd.MultiIndex):
             return merged
-        # Assume merged index names are ['instrument', 'trade_date']
-        # Target is typically ['datetime', 'instrument']
-        # Swap to ['trade_date', 'instrument']
-        merged = merged.swaplevel('instrument', 'trade_date').sort_index()
-        # Set names to match df.index.names
-        merged.index = merged.index.set_names(df.index.names)
+        # Rename 'trade_date' to 'datetime' if present
+        current_names = list(merged.index.names)
+        if 'trade_date' in current_names:
+            current_names[current_names.index('trade_date')] = 'datetime'
+            merged.index = merged.index.set_names(current_names)
+        # Reorder to match df's index names order
+        target_order = [n for n in df.index.names if n in merged.index.names]
+        if set(merged.index.names) == set(target_order) and list(merged.index.names) != target_order:
+            merged = merged.reorder_levels(target_order)
+        merged = merged.sort_index()
         return merged
 
     def _assign_factors(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
@@ -992,7 +996,10 @@ class BarraFactorProcessor(Processor):
     def _load_profile(self) -> pd.DataFrame:
         if not self.profile_csv_path:
             return pd.DataFrame()
-        prof = pd.read_csv(self.profile_csv_path)
+        try:
+            prof = pd.read_csv(self.profile_csv_path)
+        except (FileNotFoundError, ValueError):
+            return pd.DataFrame()
         # Normalize columns
         prof.columns = [str(c).strip().lower() for c in prof.columns]
         assert "ticker" in prof.columns and self.date_col in prof.columns, "CSV must include ticker and ann_date"
@@ -1091,19 +1098,23 @@ class BarraFactorProcessor(Processor):
     def _reorder_merged_index(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
         if merged.empty or not isinstance(merged.index, pd.MultiIndex):
             return merged
-        # Assume merged index names are ['instrument', 'trade_date']
-        # Target is typically ['datetime', 'instrument']
-        # Swap to ['trade_date', 'instrument']
-        merged = merged.swaplevel('instrument', 'trade_date').sort_index()
-        # Set names to match df.index.names
-        merged.index = merged.index.set_names(df.index.names)
+        # Rename 'trade_date' to 'datetime' if present
+        current_names = list(merged.index.names)
+        if 'trade_date' in current_names:
+            current_names[current_names.index('trade_date')] = 'datetime'
+            merged.index = merged.index.set_names(current_names)
+        # Reorder to match df's index names order
+        target_order = [n for n in df.index.names if n in merged.index.names]
+        if set(merged.index.names) == set(target_order) and list(merged.index.names) != target_order:
+            merged = merged.reorder_levels(target_order)
+        merged = merged.sort_index()
         return merged
 
     def _assign_factors(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
         factor_cols = [c for c in merged.columns if c not in {"instrument", "trade_date"}]
         for col in factor_cols:
             ser = merged[col].reindex(df.index).astype(float)
-            df[self.profile_prefix + col.upper()] = ser
+            df[col.upper()] = ser
         return df
 
     def _derive_core_fields(self, merged: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
@@ -1152,23 +1163,17 @@ class BarraFactorProcessor(Processor):
             return (a / b.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
 
         # ROE: prefer direct field; else compute from EARN / BE
-        if "F_ROE_RATIO" not in df.columns:
-            if "roe_ratio" in merged.columns:
-                df["F_ROE_RATIO"] = merged["roe_ratio"].reindex(df.index).astype(float)
-            elif "return_on_equity" in merged.columns:
-                df["F_ROE_RATIO"] = merged["return_on_equity"].reindex(df.index).astype(float)
-            elif all(c in df.columns for c in ["EARNINGS", "BE"]):
-                df["F_ROE_RATIO"] = safe_div(df["EARNINGS"], df["BE"])
+        if "roe_ratio" in merged.columns:
+            df["F_ROE_RATIO"] = merged["roe_ratio"].reindex(df.index).astype(float)
+        elif "return_on_equity" in merged.columns:
+            df["F_ROE_RATIO"] = merged["return_on_equity"].reindex(df.index).astype(float)
+        elif all(c in df.columns for c in ["EARNINGS", "BE"]):
+            df["F_ROE_RATIO"] = safe_div(df["EARNINGS"], df["BE"])
 
-        # Similar for other ratios...
-        # Example for GPM
-        if "F_GROSS_MARGIN" not in df.columns:
-            if "gross_margin" in merged.columns:
-                df["F_GROSS_MARGIN"] = merged["gross_margin"].reindex(df.index).astype(float)
-            elif all(c in df.columns for c in ["SALES", "COGS"]):
-                df["F_GROSS_MARGIN"] = safe_div(df["SALES"] - df["COGS"], df["SALES"])
-
-        # Add more as needed
+        if "gross_margin" in merged.columns:
+            df["F_GROSS_MARGIN"] = merged["gross_margin"].reindex(df.index).astype(float)
+        elif all(c in df.columns for c in ["SALES", "COGS"]):
+            df["F_GROSS_MARGIN"] = safe_div(df["SALES"] - df["COGS"], df["SALES"])
 
         # Backfill F_RETURN_ON_EQUITY from F_ROE_RATIO if missing
         if "F_RETURN_ON_EQUITY" not in df.columns and "F_ROE_RATIO" in df.columns:
@@ -1347,27 +1352,22 @@ class BarraFactorProcessor(Processor):
                 roe_series = pd.Series(inst_index.map(last_roe_dict), index=df.index).fillna(np.nan)
             df = df.assign(F_RETURN_ON_EQUITY=roe_series, F_ROE_RATIO=roe_series)
 
-            # ME
-            if "ME" not in df.columns:
-                if "$market_cap" in df.columns:
-                    df["ME"] = df["$market_cap"].astype(float)
-                elif "F_ME" in df.columns:
-                    df["ME"] = df["F_ME"].astype(float)
+            if "$market_cap" in df.columns:
+                df["ME"] = df["$market_cap"].astype(float)
 
             # Q_DTOA
-            if "Q_DTOA" not in df.columns:
-                q_series = pd.Series(index=df.index, dtype=float)
-                if not prof.empty and {"total_liabilities", "total_assets"}.issubset(set(prof.columns)):
-                    last_tl = prof.sort_values(["ticker", "ann_date"]).groupby("ticker")["total_liabilities"].last()
-                    last_tl = last_tl.apply(parse_ratio)
-                    last_tl_dict = {normalize_ticker(t): v for t, v in last_tl.to_dict().items()}
-                    tl_m = pd.Series(inst_index.map(last_tl_dict), index=df.index).astype(float)
-                    last_ta = prof.sort_values(["ticker", "ann_date"]).groupby("ticker")["total_assets"].last()
-                    last_ta = last_ta.apply(parse_ratio)
-                    last_ta_dict = {normalize_ticker(t): v for t, v in last_ta.to_dict().items()}
-                    ta_m = pd.Series(inst_index.map(last_ta_dict), index=df.index).astype(float)
-                    q_series = (tl_m / ta_m.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-                df = df.assign(Q_DTOA=q_series)
+            q_series = pd.Series(index=df.index, dtype=float)
+            if not prof.empty and {"total_liabilities", "total_assets"}.issubset(set(prof.columns)):
+                last_tl = prof.sort_values(["ticker", "ann_date"]).groupby("ticker")["total_liabilities"].last()
+                last_tl = last_tl.apply(parse_ratio)
+                last_tl_dict = {normalize_ticker(t): v for t, v in last_tl.to_dict().items()}
+                tl_m = pd.Series(inst_index.map(last_tl_dict), index=df.index).astype(float)
+                last_ta = prof.sort_values(["ticker", "ann_date"]).groupby("ticker")["total_assets"].last()
+                last_ta = last_ta.apply(parse_ratio)
+                last_ta_dict = {normalize_ticker(t): v for t, v in last_ta.to_dict().items()}
+                ta_m = pd.Series(inst_index.map(last_ta_dict), index=df.index).astype(float)
+                q_series = (tl_m / ta_m.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+            df = df.assign(Q_DTOA=q_series)
 
         # 1.5) Quality factors (inline)
         try:
