@@ -288,17 +288,12 @@ class Normalize:
     def _executor(self, file_path: Path):
         file_path = Path(file_path)
 
-        # some symbol_field values such as TRUE, NA are decoded as True(bool), NaN(np.float) by pandas default csv parsing.
-        # manually defines dtype and na_values of the symbol_field.
-        default_na = pd._libs.parsers.STR_NA_VALUES  # pylint: disable=I1101
-        symbol_na = default_na.copy()
-        symbol_na.remove("NA")
-        columns = pd.read_csv(file_path, nrows=0).columns
-        df = pd.read_csv(
+        # Read parquet file with explicit dtype for symbol field and handle compression
+        columns = pd.read_parquet(file_path, engine='auto').columns
+        df = pd.read_parquet(
             file_path,
+            engine='auto',
             dtype={self._symbol_field_name: str},
-            keep_default_na=False,
-            na_values={col: symbol_na if col == self._symbol_field_name else default_na for col in columns},
         )
 
         # NOTE: It has been reported that there may be some problems here, and the specific issues will be dealt with when they are identified.

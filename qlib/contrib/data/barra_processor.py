@@ -863,7 +863,7 @@ class IndustryFactorProcessor(Processor):
 class BarraFactorProcessor(Processor):
     """End-to-end processor to attach F_/Q_/Industry/CNE6/B_INDMOM in one pass.
 
-    - Reuses FundamentalProfileProcessor, BarraFundamentalQualityProcessor, IndustryProcessor
+    - Reuses FundamentalFactorProcessor, IndustryFactorProcessor
     - Uses compute_cne6_exposures with robust wide pivot via _pivot_wide
     - Computes industry momentum via IndustryMomentumProcessor (robust write-back)
     """
@@ -969,8 +969,6 @@ class BarraFactorProcessor(Processor):
                     except Exception:
                         pass
                 df[f"B_{key}"] = ser.reindex(df.index)
-
-        # Industry momentum already computed above
 
         logger.info("BarraFactorProcessor finished.")
         return df
