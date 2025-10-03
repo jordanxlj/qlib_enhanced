@@ -302,7 +302,7 @@ class Normalize:
             if self._end_date is not None:
                 _mask = pd.to_datetime(df[self._date_field_name]) <= pd.Timestamp(self._end_date)
                 df = df[_mask]
-            df.to_csv(self._target_dir.joinpath(file_path.name), index=False)
+            df.to_parquet(self._target_dir.joinpath(file_path.name), index=False, compression='gzip')
 
     def normalize(self):
         logger.info("normalize data......")
