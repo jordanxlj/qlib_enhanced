@@ -294,8 +294,10 @@ class Normalize:
         df = pd.read_parquet(
             file_path,
             engine='auto',
-            dtype={self._symbol_field_name: str},
         )
+        # Ensure symbol field is string type
+        if self._symbol_field_name in df.columns:
+            df[self._symbol_field_name] = df[self._symbol_field_name].astype(str)
 
         # NOTE: It has been reported that there may be some problems here, and the specific issues will be dealt with when they are identified.
         df = self._normalize_obj.normalize(df)
