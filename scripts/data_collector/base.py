@@ -288,6 +288,7 @@ class Normalize:
     def _executor(self, file_path: Path):
         file_path = Path(file_path)
 
+        print(f"read file, file_path: {file_path}")
         # Read parquet file with explicit dtype for symbol field and handle compression
         columns = pd.read_parquet(file_path, engine='auto').columns
         df = pd.read_parquet(
