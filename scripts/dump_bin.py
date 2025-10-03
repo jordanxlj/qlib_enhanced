@@ -134,7 +134,7 @@ class DumpDataBase:
             return _calendars.tolist()
 
     def _get_source_data(self, file_path: Path) -> pd.DataFrame:
-        df = pd.read_csv(str(file_path.resolve()), low_memory=False)
+        df = pd.read_parquet(str(file_path.resolve()), engine='auto')
         df[self.date_field_name] = df[self.date_field_name].astype(str).astype("datetime64[ns]")
         # df.drop_duplicates([self.date_field_name], inplace=True)
         return df
