@@ -40,7 +40,7 @@ class DumpDataBase:
         freq: str = "day",
         max_workers: int = 16,
         date_field_name: str = "date",
-        file_suffix: str = ".csv",
+        file_suffix: str = ".parquet",
         symbol_field_name: str = "symbol",
         exclude_fields: str = "",
         include_fields: str = "",
@@ -62,7 +62,7 @@ class DumpDataBase:
             number of threads
         date_field_name: str, default "date"
             the name of the date field in the csv
-        file_suffix: str, default ".csv"
+        file_suffix: str, default ".parquet"
             file suffix
         symbol_field_name: str, default "symbol"
             symbol field name
