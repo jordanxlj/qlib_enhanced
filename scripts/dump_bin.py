@@ -691,9 +691,18 @@ class DumpDataAggregated(DumpDataBase):
         logger.info(f"Processing {len(self.features)} features: {self.features}")
 
         # Parallel process features with global dates and symbols
-        Parallel(n_jobs=self.max_workers)(
-            delayed(self._process_feature)(feature, global_dates, global_symbols) for feature in tqdm(self.features)
-        )
+        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(self._process_feature, feature, global_dates, global_symbols): feature
+                      for feature in self.features}
+
+            with tqdm(total=len(futures)) as p_bar:
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        feature = futures[future]
+                        logger.error(f"Error processing feature {feature}: {e}")
+                    p_bar.update()
 
         # Save metadata
         self._save_metadata()
