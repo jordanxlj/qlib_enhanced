@@ -501,5 +501,263 @@ class DumpDataUpdate(DumpDataBase):
         self.save_instruments(df.reset_index())
 
 
+class DumpDataAggregated(DumpDataBase):
+    """
+    Aggregate data by feature to avoid memory overflow.
+    Each feature is processed separately, loading only required columns.
+    """
+
+    def __init__(
+        self,
+        csv_path: str,
+        qlib_dir: str,
+        normalize_dir: str = None,
+        features: list = None,
+        symbol_filter: list = None,  # e.g., CSI300 symbols
+        backup_dir: str = None,
+        freq: str = "day",
+        max_workers: int = 16,
+        date_field_name: str = "date",
+        file_suffix: str = ".parquet",
+        symbol_field_name: str = "symbol",
+        exclude_fields: str = "",
+        include_fields: str = "",
+        limit_nums: int = None,
+    ):
+        """
+        Parameters
+        ----------
+        csv_path: str
+            Directory for normalized data (input Parquet files) - used as normalize_dir
+        qlib_dir: str
+            qlib(dump) data directory - used as aggregate_dir
+        normalize_dir: str, optional
+            Alternative way to specify normalize directory
+        features: list
+            List of features to aggregate; if None, all except date/symbol
+        symbol_filter: list
+            List of symbols to include (e.g., CSI300); if None, all
+        backup_dir: str, default None
+            if backup_dir is not None, backup qlib_dir to backup_dir
+        freq: str, default "day"
+            transaction frequency
+        max_workers: int, default 16
+            number of threads
+        date_field_name: str, default "date"
+            the name of the date field in the csv
+        file_suffix: str, default ".parquet"
+            file suffix
+        symbol_field_name: str, default "symbol"
+            symbol field name
+        exclude_fields: str
+            fields not dumped
+        include_fields: str
+            dump fields
+        limit_nums: int
+            Use when debugging, default None
+        """
+        # Initialize parent class
+        super().__init__(
+            csv_path=csv_path,
+            qlib_dir=qlib_dir,
+            backup_dir=backup_dir,
+            freq=freq,
+            max_workers=max_workers,
+            date_field_name=date_field_name,
+            file_suffix=file_suffix,
+            symbol_field_name=symbol_field_name,
+            exclude_fields=exclude_fields,
+            include_fields=include_fields,
+            limit_nums=limit_nums,
+        )
+
+        # Set normalize_dir (input directory)
+        if normalize_dir is not None:
+            self.normalize_dir = Path(normalize_dir).expanduser().resolve()
+        else:
+            # Use csv_path as normalize_dir for backward compatibility
+            self.normalize_dir = Path(csv_path).expanduser().resolve()
+
+        # aggregate_dir is qlib_dir (output directory)
+        self.aggregate_dir = Path(qlib_dir).expanduser().resolve()
+        self.aggregate_dir.mkdir(parents=True, exist_ok=True)
+
+        self.features = features
+        self.symbol_filter = symbol_filter
+
+    def dump(self):
+        """Main dump method - follows the same pattern as other dump classes"""
+        logger.info("Starting aggregated data dump...")
+
+        # First dump calendars and instruments
+        global_dates, global_symbols = self._dump_calendars_and_instruments()
+        if global_dates is None or global_symbols is None:
+            return
+
+        # Then dump features
+        self._dump_features()
+
+        logger.info(f"Aggregation completed. Files saved to {self.aggregate_dir}")
+
+    def _dump_calendars_and_instruments(self):
+        """Dump calendars and instruments data"""
+        logger.info("Getting global dates and symbols...")
+        global_dates, global_symbols = self._get_global_dates_symbols()
+
+        if len(global_dates) == 0 or len(global_symbols) == 0:
+            logger.error("No dates or symbols found")
+            return None, None
+
+        # Save calendars using parent class method
+        self.save_calendars(global_dates)
+
+        # Save instruments data
+        self._save_instruments_data(global_dates, global_symbols)
+
+        # Save global dates and symbols as numpy arrays for easy loading
+        np.save(self.aggregate_dir.joinpath('dates.npy'), global_dates)
+        np.save(self.aggregate_dir.joinpath('symbols.npy'), global_symbols)
+
+        return global_dates, global_symbols
+
+    def _get_global_dates_symbols(self):
+        """Get all unique dates and symbols from all data"""
+        all_dates = set()
+        all_symbols = set()
+
+        logger.info("Collecting all dates and symbols...")
+        for file_path in tqdm(list(self.normalize_dir.glob("*.parquet"))):
+            try:
+                # Read only date and symbol columns
+                df = pd.read_parquet(file_path, columns=[self.date_field_name, self.symbol_field_name])
+                if self.symbol_filter is not None:
+                    df = df[df[self.symbol_field_name].isin(self.symbol_filter)]
+
+                if not df.empty:
+                    all_dates.update(df[self.date_field_name].dropna().unique())
+                    all_symbols.update(df[self.symbol_field_name].dropna().unique())
+            except Exception as e:
+                logger.warning(f"Error reading {file_path}: {e}")
+                continue
+
+        dates = np.sort(list(all_dates))
+        symbols = np.sort(list(all_symbols))
+
+        logger.info(f"Found {len(dates)} dates and {len(symbols)} symbols")
+        return dates, symbols
+
+
+    def _save_instruments_data(self, global_dates, global_symbols):
+        """Save instruments data using parent class method"""
+        instruments_data = []
+        start_date = self._format_datetime(global_dates[0])
+        end_date = self._format_datetime(global_dates[-1])
+
+        for symbol in global_symbols:
+            instruments_data.append(f"{symbol}\t{start_date}\t{end_date}")
+
+        self.save_instruments(instruments_data)
+
+    def _dump_features(self):
+        """Dump aggregated features data"""
+        logger.info("Aggregating features to .npz files......")
+
+        # Get global dates and symbols (already saved in _dump_calendars_and_instruments)
+        global_dates, global_symbols = self._get_global_dates_symbols()
+
+        if len(global_dates) == 0 or len(global_symbols) == 0:
+            logger.error("No dates or symbols found")
+            return
+
+        # Get features if not provided
+        if self.features is None:
+            sample_file = next(self.normalize_dir.glob("*.parquet"), None)
+            if sample_file:
+                try:
+                    # Read just the header to get column names
+                    sample_df = pd.read_parquet(sample_file, nrows=0)
+                    self.features = sample_df.columns.drop([self.date_field_name, self.symbol_field_name]).tolist()
+                except Exception as e:
+                    logger.error(f"Error reading sample file {sample_file}: {e}")
+                    return
+            else:
+                logger.error("No parquet files found in normalize_dir")
+                return
+
+        if not self.features:
+            logger.warning("No features to aggregate")
+            return
+
+        logger.info(f"Processing {len(self.features)} features: {self.features}")
+
+        # Parallel process features with global dates and symbols
+        Parallel(n_jobs=self.max_workers)(
+            delayed(self._process_feature)(feature, global_dates, global_symbols) for feature in tqdm(self.features)
+        )
+
+        # Save metadata
+        self._save_metadata()
+
+    def _process_feature(self, feature, global_dates, global_symbols):
+        """Aggregate data for a single feature into a 2D NumPy array (dates x symbols)"""
+        # Collect data from all Parquet files
+        data_frames = []
+        for file_path in self.normalize_dir.glob("*.parquet"):
+            try:
+                # Read only required columns to save memory
+                df = pd.read_parquet(file_path, columns=[self.date_field_name, self.symbol_field_name, feature])
+                if self.symbol_filter is not None:
+                    df = df[df[self.symbol_field_name].isin(self.symbol_filter)]
+                data_frames.append(df)
+            except Exception as e:
+                logger.warning(f"Error reading {feature} from {file_path}: {e}")
+                continue
+
+        if not data_frames:
+            logger.warning(f"No data for feature {feature}")
+            return
+
+        # Concat and pivot
+        all_df = pd.concat(data_frames, ignore_index=True)
+
+        # Remove duplicates (same symbol-date-feature combination)
+        all_df = all_df.drop_duplicates([self.date_field_name, self.symbol_field_name])
+
+        # Pivot to create 2D array
+        pivot_df = all_df.pivot(index=self.date_field_name, columns=self.symbol_field_name, values=feature)
+
+        # Reindex to global dates and symbols to ensure consistent shape
+        pivot_df = pivot_df.reindex(index=global_dates, columns=global_symbols)
+
+        # Convert to NumPy array (fill NaN with 0 or appropriate value)
+        data_array = pivot_df.fillna(0).to_numpy(dtype=np.float32)
+
+        # Save feature data
+        np.savez_compressed(self.aggregate_dir.joinpath(f'{feature}.npz'), data=data_array)
+        logger.info(f"Aggregated {feature} to shape {data_array.shape}")
+
+    def _save_metadata(self):
+        """Save aggregation metadata"""
+        metadata = {
+            "features": self.features,
+            "symbol_filter": self.symbol_filter,
+            "normalize_dir": str(self.normalize_dir),
+            "aggregate_dir": str(self.aggregate_dir),
+            "created_at": pd.Timestamp.now().isoformat(),
+            "date_field_name": self.date_field_name,
+            "symbol_field_name": self.symbol_field_name,
+        }
+
+        metadata_path = self.aggregate_dir / "metadata.json"
+        import json
+        with open(metadata_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+
 if __name__ == "__main__":
-    fire.Fire({"dump_all": DumpDataAll, "dump_fix": DumpDataFix, "dump_update": DumpDataUpdate})
+    fire.Fire({
+        "dump_all": DumpDataAll,
+        "dump_fix": DumpDataFix,
+        "dump_update": DumpDataUpdate,
+        "dump_aggregated": DumpDataAggregated
+    })
