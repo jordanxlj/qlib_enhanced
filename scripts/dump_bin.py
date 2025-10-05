@@ -615,8 +615,8 @@ class DumpDataAggregated(DumpDataBase):
         self._save_instruments_data(global_dates, global_symbols)
 
         # Save global dates and symbols as numpy arrays for easy loading
-        np.save(self.aggregate_dir.joinpath('dates.npy'), global_dates)
-        np.save(self.aggregate_dir.joinpath('symbols.npy'), global_symbols)
+        np.save(self.aggregate_dir.joinpath(self._features_dir, 'dates.npy'), global_dates)
+        np.save(self.aggregate_dir.joinpath(self._features_dir, 'symbols.npy'), global_symbols)
 
         return global_dates, global_symbols
 
@@ -742,7 +742,7 @@ class DumpDataAggregated(DumpDataBase):
         data_array = pivot_df.fillna(0).to_numpy(dtype=np.float32)
 
         # Save feature data
-        np.savez_compressed(self.aggregate_dir.joinpath(f'{feature}.npz'), data=data_array)
+        np.savez_compressed(self.aggregate_dir.joinpath(self._features_dir, f'{feature}.npz'), data=data_array)
         logger.info(f"Aggregated {feature} to shape {data_array.shape}")
 
     def _save_metadata(self):
