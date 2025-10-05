@@ -674,8 +674,8 @@ class DumpDataAggregated(DumpDataBase):
             sample_file = next(self.normalize_dir.glob("*.parquet"), None)
             if sample_file:
                 try:
-                    # Read just the header to get column names
-                    sample_df = pd.read_parquet(sample_file, nrows=0)
+                    # Read parquet file to get column names
+                    sample_df = pd.read_parquet(sample_file, engine='auto')
                     self.features = sample_df.columns.drop([self.date_field_name, self.symbol_field_name]).tolist()
                 except Exception as e:
                     logger.error(f"Error reading sample file {sample_file}: {e}")
