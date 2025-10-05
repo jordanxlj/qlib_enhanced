@@ -691,7 +691,7 @@ class DumpDataAggregated(DumpDataBase):
         logger.info(f"Processing {len(self.features)} features: {self.features}")
 
         # Parallel process features with global dates and symbols
-        with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+        with ProcessPoolExecutor(max_workers=self.works) as executor:
             futures = {executor.submit(self._process_feature, feature, global_dates, global_symbols): feature
                       for feature in self.features}
 
