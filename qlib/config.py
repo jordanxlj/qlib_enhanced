@@ -135,6 +135,7 @@ _default_config = {
     "calendar_provider": "LocalCalendarProvider",
     "instrument_provider": "LocalInstrumentProvider",
     "feature_provider": "LocalFeatureProvider",
+    "backend_obj": {'class': 'AggregateFileFeatureStorage', 'module_path': 'qlib.data.storage.file_storage'},
     "pit_provider": "LocalPITProvider",
     "expression_provider": "LocalExpressionProvider",
     "dataset_provider": "LocalDatasetProvider",
@@ -274,7 +275,7 @@ MODE_CONF = {
         # The nfs should be auto-mounted by qlib on other
         # serversS(such as PAI) [auto_mount:True]
         "timeout": 100,
-        "logging_level": logging.INFO,
+        "logging_level": logging.DEBUG,
         "region": REG_CN,
         # custom operator
         # each element of custom_ops should be Type[ExpressionOps] or dict

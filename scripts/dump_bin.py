@@ -589,6 +589,9 @@ class DumpDataAggregated(DumpDataBase):
         """Main dump method - follows the same pattern as other dump classes"""
         logger.info("Starting aggregated data dump...")
 
+        #makedir features
+        self._features_dir.mkdir(parents=True, exist_ok=True)
+
         # First dump calendars and instruments
         global_dates, global_symbols = self._dump_calendars_and_instruments()
         if global_dates is None or global_symbols is None:
@@ -742,7 +745,7 @@ class DumpDataAggregated(DumpDataBase):
         data_array = pivot_df.fillna(0).to_numpy(dtype=np.float32)
 
         # Save feature data
-        np.savez_compressed(self.aggregate_dir.joinpath(self._features_dir, f'{feature}.npz'), data=data_array)
+        np.savez_compressed(self.aggregate_dir.joinpath(self._features_dir, f'{feature}.{self.freq}.npz'), data=data_array)
         logger.info(f"Aggregated {feature} to shape {data_array.shape}")
 
     def _save_metadata(self):

@@ -377,3 +377,220 @@ class FileFeatureStorage(FileStorageMixin, FeatureStorage):
     def __len__(self) -> int:
         self.check()
         return self.uri.stat().st_size // 4 - 1
+
+
+class AggregateFileFeatureStorage(FeatureStorage):
+    """FeatureStorage that reads from aggregated npz files in data_new/features directory.
+    
+    Each feature has one npz file, and stock order is determined by symbols.npy file.
+    """
+    
+    # Class-level caches (singleton pattern) to avoid reloading data for each instrument
+    _feature_data_cache: Dict[str, np.ndarray] = {}
+    _symbols_cache: Dict[str, np.ndarray] = {}
+    _symbol_to_index_cache: Dict[str, Dict[str, int]] = {}
+    
+    def __init__(self, instrument: str, field: str, freq: str, provider_uri: Union[str, dict] = None, provider_uri_map: dict = None, **kwargs):
+        super(AggregateFileFeatureStorage, self).__init__(instrument, field, freq, **kwargs)
+        # Support both provider_uri and provider_uri_map (for compatibility with backend config)
+        # Use provider_uri_map if provided (from backend kwargs), otherwise use provider_uri
+        if provider_uri_map is not None:
+            self._provider_uri = C.DataPathManager.format_provider_uri(provider_uri_map)
+        elif provider_uri is None:
+            self._provider_uri = None
+        elif isinstance(provider_uri, dict):
+            self._provider_uri = C.DataPathManager.format_provider_uri(provider_uri)
+        else:
+            # If it's a string path, use it directly
+            self._provider_uri = provider_uri
+    
+    @property
+    def provider_uri(self):
+        """Get provider_uri from instance or global config."""
+        if self._provider_uri is not None:
+            return self._provider_uri
+        # Fall back to global config if not provided
+        return C.get("provider_uri", None)
+    
+    @property
+    def features_dir(self) -> Path:
+        """Get the features directory path."""
+        provider_uri = self.provider_uri
+        if provider_uri is None:
+            raise ValueError("provider_uri must be provided for AggregateFileFeatureStorage")
+        # If provider_uri is a dict (DataPathManager format), use dpm
+        if isinstance(provider_uri, dict):
+            dpm = C.DataPathManager(provider_uri, C.mount_path)
+            # Get the data URI for the freq, then join features directory
+            return dpm.get_data_uri(self.freq).joinpath("features")
+        else:
+            # If provider_uri is a string path, use it directly
+            return Path(provider_uri).joinpath("features")
+    
+    @property
+    def symbols_file(self) -> Path:
+        """Get the symbols.npy file path."""
+        return self.features_dir.joinpath("symbols.npy")
+    
+    @property
+    def feature_file(self) -> Path:
+        """Get the npz file path for this feature."""
+        return self.features_dir.joinpath(f"{self.field.lower()}.npz")
+    
+    def _load_symbols(self):
+        """Load symbols from symbols.npy and create index mapping (singleton)."""
+        symbols_file_str = str(self.symbols_file)
+        
+        # Check class-level cache first
+        if symbols_file_str in self._symbols_cache:
+            return
+        
+        if not self.symbols_file.exists():
+            raise ValueError(f"Symbols file not found: {self.symbols_file}")
+        
+        # Load symbols
+        symbols = np.load(self.symbols_file)
+        self._symbols_cache[symbols_file_str] = symbols
+        
+        # Create mapping from symbol to column index
+        symbol_to_index = {}
+        for idx, symbol in enumerate(symbols):
+            symbol_str = str(symbol) if not isinstance(symbol, str) else symbol
+            symbol_to_index[symbol_str] = idx
+            # Also store lowercase version for easier lookup
+            symbol_to_index[symbol_str.lower()] = idx
+        
+        self._symbol_to_index_cache[symbols_file_str] = symbol_to_index
+    
+    def _get_symbol_index(self) -> int:
+        """Get the column index for this instrument."""
+        self._load_symbols()
+        symbols_file_str = str(self.symbols_file)
+        symbol_to_index = self._symbol_to_index_cache[symbols_file_str]
+        
+        # Try to find the instrument in symbols (exact match first)
+        if self.instrument in symbol_to_index:
+            return symbol_to_index[self.instrument]
+        
+        # Try lowercase version
+        instrument_lower = self.instrument.lower()
+        if instrument_lower in symbol_to_index:
+            return symbol_to_index[instrument_lower]
+        
+        raise ValueError(f"Instrument {self.instrument} not found in symbols.npy")
+    
+    def _load_feature_data(self):
+        """Load feature data from npz file (singleton)."""
+        feature_file_str = str(self.feature_file)
+        
+        # Check class-level cache first
+        if feature_file_str in self._feature_data_cache:
+            return
+        
+        if not self.feature_file.exists():
+            raise ValueError(f"Feature file not found: {self.feature_file}")
+        
+        npz_data = np.load(self.feature_file)
+        if 'data' not in npz_data:
+            npz_data.close()
+            raise ValueError(f"Feature file {self.feature_file} does not contain 'data' key")
+        
+        # Copy data to avoid keeping the file open, and cache it
+        self._feature_data_cache[feature_file_str] = npz_data['data'].copy()
+        npz_data.close()
+    
+    def _get_stock_data(self) -> np.ndarray:
+        """Get the time series data for this stock."""
+        self._load_feature_data()
+        symbol_idx = self._get_symbol_index()
+        
+        feature_file_str = str(self.feature_file)
+        feature_data = self._feature_data_cache[feature_file_str]
+        
+        if symbol_idx >= feature_data.shape[1]:
+            raise ValueError(f"Symbol index {symbol_idx} exceeds feature data shape {feature_data.shape}")
+        
+        return feature_data[:, symbol_idx]
+    
+    def check(self):
+        """Check if required files exist."""
+        if not self.features_dir.exists():
+            raise ValueError(f"Features directory not exists: {self.features_dir}")
+        if not self.symbols_file.exists():
+            raise ValueError(f"Symbols file not exists: {self.symbols_file}")
+        if not self.feature_file.exists():
+            raise ValueError(f"Feature file not exists: {self.feature_file}")
+    
+    def clear(self) -> None:
+        """Clear is not supported for AggregateFileFeatureStorage (read-only)."""
+        raise NotImplementedError("AggregateFileFeatureStorage is read-only")
+    
+    def write(self, data_array: Union[List, np.ndarray], index: int = None) -> None:
+        """Write is not supported for AggregateFileFeatureStorage (read-only)."""
+        raise NotImplementedError("AggregateFileFeatureStorage is read-only")
+    
+    @property
+    def start_index(self) -> Union[int, None]:
+        """Get the start index (always 0 for aggregated data)."""
+        self.check()
+        return 0
+    
+    @property
+    def end_index(self) -> Union[int, None]:
+        """Get the end index."""
+        self.check()
+        data = self._get_stock_data()
+        return len(data) - 1 if len(data) > 0 else None
+    
+    @property
+    def data(self) -> pd.Series:
+        """Get all data as a pandas Series."""
+        return self[:]
+    
+    def __getitem__(self, i: Union[int, slice]) -> Union[Tuple[int, float], pd.Series]:
+        """Get data by index or slice."""
+        self.check()
+        
+        stock_data = self._get_stock_data()
+
+        if len(stock_data) == 0:
+            if isinstance(i, int):
+                return None, None
+            elif isinstance(i, slice):
+                return pd.Series(dtype=np.float32)
+            else:
+                raise TypeError(f"type(i) = {type(i)}")
+        
+        if isinstance(i, int):
+            if i < 0 or i >= len(stock_data):
+                raise IndexError(f"Index {i} out of range [0, {len(stock_data)})")
+            value = float(stock_data[i])
+            return i, value
+        elif isinstance(i, slice):
+            start = i.start if i.start is not None else 0
+            stop = i.stop if i.stop is not None else len(stock_data)
+            step = i.step if i.step is not None else 1
+            
+            # Handle negative indices
+            if start < 0:
+                start = max(0, len(stock_data) + start)
+            if stop < 0:
+                stop = max(0, len(stock_data) + stop)
+            
+            # Clamp to valid range
+            start = max(0, min(start, len(stock_data)))
+            stop = max(0, min(stop, len(stock_data)))
+            
+            if start >= stop:
+                return pd.Series(dtype=np.float32)
+            
+            selected_data = stock_data[start:stop:step]
+            return pd.Series(selected_data, index=pd.RangeIndex(start, stop, step), dtype=np.float32)
+        else:
+            raise TypeError(f"type(i) = {type(i)}")
+    
+    def __len__(self) -> int:
+        """Get the length of the data."""
+        self.check()
+        stock_data = self._get_stock_data()
+        return len(stock_data)
