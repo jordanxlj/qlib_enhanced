@@ -435,7 +435,7 @@ class AggregateFileFeatureStorage(FeatureStorage):
     @property
     def feature_file(self) -> Path:
         """Get the npz file path for this feature."""
-        return self.features_dir.joinpath(f"{self.field.lower()}.npz")
+        return self.features_dir.joinpath(f"{self.field.lower()}.{self.freq}.npz")
     
     def _load_symbols(self):
         """Load symbols from symbols.npy and create index mapping (singleton)."""

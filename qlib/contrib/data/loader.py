@@ -390,3 +390,100 @@ class AlphaCNE6DL(Alpha158DL):
         names += size_names
 
         return fields, names
+
+
+class EnhancedAlpha158DL(Alpha158DL):
+    """Dataloader to get Alpha158 base features plus additional fundamental and technical factors.
+    
+    Extends Alpha158DL by adding enhanced factors with industry neutralization.
+    All additional factors are neutralized by industry using IndustryNeutralizeProcessor.
+    """
+
+    @staticmethod
+    def get_feature_config(base_config=None):
+        # Start from Alpha158 default config
+        fields, names = Alpha158DL.get_feature_config(config=base_config or {
+            "kbar": {},
+            "price": {"windows": [0], "feature": ["OPEN", "HIGH", "LOW", "VWAP", "CLOSE"]},
+            "rolling": {},
+        })
+
+        # Additional factors to add (industry neutralized)
+        # Format: factor_name -> field_name (assuming these map to $field_name in provider)
+        additional_factors = [
+            ("ar_turn", "$ar_turn"),
+            ("assets_turn", "$assets_turn"),
+            ("assets_yoy", "$assets_yoy"),
+            ("basic_eps_yoy", "$basic_eps_yoy"),
+            ("bps", "$bps"),
+            ("ca_turn", "$ca_turn"),
+            ("cash_ratio", "$cash_ratio"),
+            ("cfps", "$cfps"),
+            ("cost_15pct", "$cost_15pct"),
+            ("cost_50pct", "$cost_50pct"),
+            ("cost_5pct", "$cost_5pct"),
+            ("cost_85pct", "$cost_85pct"),
+            ("cost_95pct", "$cost_95pct"),
+            ("current_ratio", "$current_ratio"),
+            ("debt_to_assets", "$debt_to_assets"),
+            ("debt_to_ebitda", "$debt_to_ebitda"),
+            ("debt_to_eqt", "$debt_to_eqt"),
+            ("dv_ratio", "$dv_ratio"),
+            ("eps_ttm", "$eps_ttm"),
+            ("equity_yoy", "$equity_yoy"),
+            ("f_dv_ratio", "$f_dv_ratio"),
+            ("f_eps", "$f_eps"),
+            ("f_neg_ratio", "$f_neg_ratio"),
+            ("f_pe", "$f_pe"),
+            ("f_pos_ratio", "$f_pos_ratio"),
+            ("f_roe", "$f_roe"),
+            ("f_target_price", "$f_target_price"),
+            ("fa_turn", "$fa_turn"),
+            ("fcf_margin_ttm", "$fcf_margin_ttm"),
+            ("fcff_ps", "$fcff_ps"),
+            ("goodwill", "$goodwill"),
+            ("grossprofit_margin_ttm", "$grossprofit_margin_ttm"),
+            ("inv_turn", "$inv_turn"),
+            ("main_inflow_ratio", "$main_inflow_ratio"),
+            ("market_cap", "$market_cap"),
+            ("net_inflow_ratio", "$net_inflow_ratio"),
+            ("netincome_cagr_3y", "$netincome_cagr_3y"),
+            ("netprofit_margin_ttm", "$netprofit_margin_ttm"),
+            ("netprofit_yoy", "$netprofit_yoy"),
+            ("ocf_yoy", "$ocf_yoy"),
+            ("open", "$open"),
+            ("or_yoy", "$or_yoy"),
+            ("pb", "$pb"),
+            ("pe", "$pe"),
+            ("ps", "$ps"),
+            ("quick_ratio", "$quick_ratio"),
+            ("rd_exp_to_capex", "$rd_exp_to_capex"),
+            ("revenue_cagr_3y", "$revenue_cagr_3y"),
+            ("revenue_ps_ttm", "$revenue_ps_ttm"),
+            ("roa_ttm", "$roa_ttm"),
+            ("roe_ttm", "$roe_ttm"),
+            ("roe_yoy", "$roe_yoy"),
+            ("roic", "$roic"),
+            ("small_inflow_ratio", "$small_inflow_ratio"),
+            ("turnover", "$turnover"),
+            ("volume_ratio", "$volume_ratio"),
+            ("weight_avg", "$weight_avg"),
+            ("winner_rate", "$winner_rate"),
+        ]
+
+        # Add raw factors (industry neutralization will be done via processor)
+        # Industry neutralization: (factor - industry_mean) / industry_std, using pandas groupby(industry)
+        # Note: Industry neutralization should be performed using IndustryNeutralizeProcessor
+        # after data loading, as qlib doesn't support GroupNeutralize in expressions
+        extra_fields = []
+        extra_names = []
+        
+        for name, field in additional_factors:
+            # Add raw factor field (industry neutralization will be applied later via processor)
+            extra_fields.append(field)
+            extra_names.append(name.upper())
+
+        fields += extra_fields
+        names += extra_names
+
+        return fields, names

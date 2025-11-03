@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from qlib.contrib.data.loader import Alpha158DL, Alpha360DL
+from qlib.contrib.data.loader import Alpha158DL, Alpha360DL, EnhancedAlpha158DL
 from ...data.dataset.handler import DataHandlerLP
 from ...data.dataset.processor import Processor
 from ...utils import get_callable_kwargs
@@ -37,6 +37,7 @@ def check_transform_proc(proc_l, fit_start_time, fit_end_time):
 _DEFAULT_LEARN_PROCESSORS = [
     {"class": "DropnaLabel"},
     {"class": "CSZScoreNorm", "kwargs": {"fields_group": "label"}},
+    {"class": "IndustryZScoreNorm", "kwargs": {"fields_group": ["pe", "pb", "ps", "dv_ratio", "weight_avg", "winner_rate", "f_eps", "f_pe", "f_dv_ratio", "f_roe", "current_ratio", "quick_ratio", "cash_ratio", "roic", "roe_ttm", "roa_ttm", "grossprofit_margin_ttm", "netprofit_margin_ttm", "fcf_margin_ttm", "debt_to_assets", "debt_to_eqt", "debt_to_ebitda", "bps", "eps_ttm", "revenue_ps_ttm", "cfps", "fcff_ps", "or_yoy", "netprofit_yoy", "basic_eps_yoy", "equity_yoy", "assets_yoy", "ocf_yoy", "roe_yoy", "revenue_cagr_3y", "netincome_cagr_3y", "rd_exp_to_capex"]}},
 ]
 _DEFAULT_INFER_PROCESSORS = [
     {"class": "ProcessInf", "kwargs": {}},
@@ -155,3 +156,63 @@ class Alpha158(DataHandlerLP):
 class Alpha158vwap(Alpha158):
     def get_label_config(self):
         return ["Ref($vwap, -2)/Ref($vwap, -1) - 1"], ["LABEL0"]
+
+
+class EnhancedAlpha158(DataHandlerLP):
+    """Enhanced Alpha158 handler.
+    """
+
+    def __init__(
+        self,
+        instruments="csi500",
+        start_time=None,
+        end_time=None,
+        freq="day",
+        infer_processors=[],
+        learn_processors=_DEFAULT_LEARN_PROCESSORS,
+        fit_start_time=None,
+        fit_end_time=None,
+        process_type=DataHandlerLP.PTYPE_A,
+        filter_pipe=None,
+        inst_processors=None,
+        **kwargs,
+    ):
+        infer_processors = check_transform_proc(infer_processors, fit_start_time, fit_end_time)
+        learn_processors = check_transform_proc(learn_processors, fit_start_time, fit_end_time)
+
+        data_loader = {
+            "class": "QlibDataLoader",
+            "kwargs": {
+                "config": {
+                    "feature": self.get_feature_config(),
+                    "label": kwargs.pop("label", self.get_label_config()),
+                },
+                "filter_pipe": filter_pipe,
+                "freq": freq,
+                "inst_processors": inst_processors,
+            },
+        }
+        super().__init__(
+            instruments=instruments,
+            start_time=start_time,
+            end_time=end_time,
+            data_loader=data_loader,
+            learn_processors=learn_processors,
+            infer_processors=infer_processors,
+            process_type=process_type,
+            **kwargs,
+        )
+
+    def get_feature_config(self):
+        conf = {
+            "kbar": {},
+            "price": {
+                "windows": [0],
+                "feature": ["OPEN", "HIGH", "LOW", "VWAP"],
+            },
+            "rolling": {},
+        }
+        return EnhancedAlpha158DL.get_feature_config(conf)
+
+    def get_label_config(self):
+        return ["Ref($close, -2)/Ref($close, -1) - 1"], ["LABEL0"]
