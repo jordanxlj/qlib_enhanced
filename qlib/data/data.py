@@ -1305,7 +1305,8 @@ def register_all_wrappers(C):
     logger.debug(f"registering Inst {C.instrument_provider}")
 
     if getattr(C, "feature_provider", None) is not None:
-        feature_provider = init_instance_by_config(C.feature_provider, module)
+        backend_obj = getattr(C, "backend_obj", None)
+        feature_provider = init_instance_by_config(C.feature_provider, module, backend=backend_obj)
         register_wrapper(FeatureD, feature_provider, "qlib.data")
         logger.debug(f"registering FeatureD {C.feature_provider}")
 
