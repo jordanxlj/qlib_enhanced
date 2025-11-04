@@ -5,6 +5,7 @@ import abc
 from typing import Union, Text, Optional
 import numpy as np
 import pandas as pd
+from pandas import Grouper
 
 from qlib.utils.data import robust_zscore, zscore
 from ...constant import EPS
@@ -484,9 +485,9 @@ class IndustryZScoreNorm(Processor):
         Column name containing industry classification.
     """
 
-    def __init__(self, fields_group=None, industry_col="industry"):
+    def __init__(self, fields_groups=None, industry_col="industry"):
         super().__init__()
-        self.fields_group = fields_group
+        self.fields_groups = fields_groups if isinstance(fields_groups, list) else [fields_groups] if fields_groups else []
         self.industry_col = industry_col
 
     def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -506,70 +507,52 @@ class IndustryZScoreNorm(Processor):
         if df is None or df.empty:
             return df
 
-        # Get columns to neutralize
-        cols = get_group_columns(df, self.fields_group)
-
         # Check if industry column exists
-        if self.industry_col not in df.columns:
-            import warnings
+        industry_cols = df.columns[df.columns.get_level_values(1).str.contains(self.industry_col.upper())]
+        if len(industry_cols) == 0:
             warnings.warn(
                 f"Industry column '{self.industry_col}' not found in DataFrame. "
                 "Skipping industry neutralization. "
                 "Make sure to add industry information using IndustryFactorProcessor first."
             )
             return df
+        # Get the actual column tuple for the industry column
+        industry_col = industry_cols[0]
 
-        # Industry neutralization: (factor - industry_mean) / industry_std
-        # For each datetime, group by industry and perform standardization within industry
+        # Determine the datetime level for grouping
         if isinstance(df.index, pd.MultiIndex):
             idx_names = list(df.index.names)
             if "datetime" in idx_names:
-                # Group by datetime, then for each datetime group by industry
-                def neutralize_by_datetime(date_group):
-                    """Neutralize factors within each datetime by industry"""
-                    # Convert industry column to int type for proper grouping
-                    industry_int = date_group[self.industry_col].astype(int)
-
-                    # Group by industry within this datetime and calculate mean and std
-                    industry_mean = date_group.groupby(industry_int)[cols].transform("mean")
-                    industry_std = date_group.groupby(industry_int)[cols].transform("std")
-
-                    # Handle zero or NaN standard deviations
-                    industry_std = industry_std.replace(0, np.nan).fillna(1.0)
-
-                    # Industry neutralization: (factor - industry_mean) / industry_std
-                    neutralized = (date_group[cols] - industry_mean) / industry_std
-                    return neutralized
-
-                # Apply neutralization grouped by datetime
-                neutralized_data = df.groupby(level="datetime", group_keys=False).apply(neutralize_by_datetime)
-                df[cols] = neutralized_data
+                datetime_grouper = Grouper(level="datetime")
             else:
                 # Fallback: assume datetime is level 0
-                datetime_level = 0
-                def neutralize_by_datetime(date_group):
-                    """Neutralize factors within each datetime by industry"""
-                    # Convert industry column to int type for proper grouping
-                    industry_int = date_group[self.industry_col].astype(int)
-
-                    # Group by industry within this datetime and calculate mean and std
-                    industry_mean = date_group.groupby(industry_int)[cols].transform("mean")
-                    industry_std = date_group.groupby(industry_int)[cols].transform("std")
-
-                    # Handle zero or NaN standard deviations
-                    industry_std = industry_std.replace(0, np.nan).fillna(1.0)
-
-                    # Industry neutralization: (factor - industry_mean) / industry_std
-                    neutralized = (date_group[cols] - industry_mean) / industry_std
-                    return neutralized
-
-                neutralized_data = df.groupby(level=datetime_level, group_keys=False).apply(neutralize_by_datetime)
-                df[cols] = neutralized_data
+                datetime_grouper = Grouper(level=0)
         else:
-            import warnings
             warnings.warn(
                 "DataFrame index is not MultiIndex. "
                 "Industry Z-Score Normalization requires MultiIndex (datetime, instrument)."
             )
+            return df
+
+        # Convert industry column to int type for proper grouping
+        df[industry_col] = df[industry_col].astype(int)
+
+        for fields_group in self.fields_groups:
+            cols = df.columns[df.columns.get_level_values(1).str.contains(fields_group.upper())]
+            if len(cols) == 0:
+                print(f"fields_group: {fields_group}, no matching columns found")
+                continue
+
+            # Vectorized industry neutralization using double groupby with transform
+            groupby_obj = df.groupby([datetime_grouper, df[industry_col]])
+            
+            industry_mean = groupby_obj[cols].transform("mean")
+            industry_std = groupby_obj[cols].transform("std")
+            
+            # Handle zero or NaN standard deviations
+            industry_std = industry_std.replace(0, np.nan).fillna(1.0)
+            
+            # Industry neutralization: (factor - industry_mean) / industry_std
+            df[cols] = (df[cols] - industry_mean) / industry_std
 
         return df
